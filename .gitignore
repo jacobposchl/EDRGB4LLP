@@ -1,0 +1,28 @@
+#Virtual Envs, I recommend using your own venv and install reqs
+venv/
+env/
+Env/
+.venv
+
+
+#We don't wanna clutter github
+data/
+
+#Misc.
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
