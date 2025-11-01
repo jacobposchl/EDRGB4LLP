@@ -5,8 +5,11 @@ Env/
 .venv
 
 
+
 #We don't wanna clutter github
 data/
+_out/
+*.zip
 
 #Misc.
 
