@@ -17,26 +17,33 @@ import hdf5plugin  # noqa: F401
 
 # ---------- helpers ----------
 
+#loads our config file
 def load_config(path: Path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
+#creates a directory if it doesn't exist
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
     return p
 
+
+#atomically saves numpy arrays in compressed .npz format
 def save_npz(path: Path, array_name: str, arr: np.ndarray):
     # atomic-ish write
     tmp = path.with_suffix(path.suffix + ".tmp")
     np.savez_compressed(tmp, **{array_name: arr})
     os.replace(tmp, path)
 
+
+#atomically saves JSON files
 def save_json(path: Path, obj: dict):
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
 
+#resizes PIL images to target size, ensuring RGB mode
 def pil_resize_keep_rgb(img: Image.Image, size_hw):
     H, W = size_hw
     if img.mode != "RGB":
@@ -47,21 +54,35 @@ def pil_resize_keep_rgb(img: Image.Image, size_hw):
 
 def main():
     ap = argparse.ArgumentParser()
+    #pass in the config file path
     ap.add_argument("--config", default="config.yaml")
+    #split the dataset to process (train or test)
     ap.add_argument("--split", default="train", choices=["train", "test"])
+    #limit the processing to N samples (default = 50)
     ap.add_argument("--max-samples", type=int, default=50, help="process only N samples for a smoke test")
+    #override output sequence folder name 
     ap.add_argument("--seq-id", default=None, help="override sequence folder name (default dsec_<split>)")
     args = ap.parse_args()
 
     cfg = load_config(Path(args.config))
 
+    #target res for resizing
     H = int(cfg["resize"]["H"])
     W = int(cfg["resize"]["W"])
+
+    #number of temporal bins for voxel grid
     bins = int(cfg["bins"])
+
+    #ms window for event accumulation
     window_ms = float(cfg["window_ms"])
+    
+    #output directory
     bucket_root = Path(cfg["bucket_root"])
+
+    #where raw DSEC data is cached
     raw_root = Path(cfg["raw_local_root"])
 
+    #output dir format
     seq_id = args.seq_id or f"dsec_{args.split}"
     seq_root = bucket_root / "sequences" / seq_id
     rgb_dir   = ensure_dir(seq_root / "rgb")

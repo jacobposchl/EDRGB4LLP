@@ -17,8 +17,9 @@ rgb_norm:
 
 event_norm: none   # we leave event tensors raw for now
 
-# Where processed data will be written in the bucket mount
-bucket_root: /mnt/bucket/event-rgb/processed/v1
+# Where processed data will be written (local Windows path)
+# Will be uploaded to GCP bucket later using upload_to_gcp.py
+bucket_root: ./processed/v1
 
 # DSEC dataset raw download cache
 raw_local_root: ./raw
