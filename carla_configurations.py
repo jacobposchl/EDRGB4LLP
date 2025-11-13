@@ -1,84 +1,4 @@
-"""Project CARLA configuration helpers.
-
-This module attempts to prefer the CARLA Python egg bundled with a
-WindowsNoEditor distribution when available. Put an egg path at the
-front of sys.path so the client binary API matches the running
-simulator (avoids API version mismatches/assertions).
-"""
-
-# --- Make CARLA egg importable on Windows (robust loader) ---
-import sys, glob, os
-
-# Common locations to check (adjust if your WindowsNoEditor is elsewhere)
-base_dirs = [
-    r"C:\Users\jakep\Desktop\WindowsNoEditor\PythonAPI\carla\dist",
-    r"C:\Program Files\CARLA\PythonAPI\carla\dist",
-]
-
-egg = None
-for base in base_dirs:
-    try:
-        eggs = glob.glob(os.path.join(base, "carla-*.egg"))
-    except Exception:
-        eggs = []
-    if eggs:
-        egg = eggs[-1]
-        break
-
-# Fallback: search up from this file for any carla-*.egg (recursive, may be slow)
-if egg is None:
-    workspace_base = os.path.dirname(__file__)
-    eggs = glob.glob(os.path.join(workspace_base, "..", "**", "carla-*.egg"), recursive=True)
-    if eggs:
-        egg = eggs[-1]
-
-if egg:
-    # Put the egg first so it takes precedence over any pip-installed package
-    if egg not in sys.path:
-        sys.path.insert(0, egg)
-        print(f"Using CARLA egg: {egg}")
-else:
-    print("Warning: no CARLA egg found automatically. If you see API version mismatches, either install a matching pip 'carla' package or set the egg path explicitly.")
-
-# On Windows the Python extension (`libcarla.pyd`) depends on native DLLs that
-# live next to the CARLA editor/binaries. If those directories aren't on the
-# PATH the import will fail with "DLL load failed". Try to prepend likely
-# locations (only if they exist and contain DLLs) so imports succeed.
-if os.name == 'nt':
-    dll_dirs = []
-    try:
-        # directory containing the egg (dist folder)
-        if egg:
-            egg_dir = os.path.dirname(egg)
-            dll_dirs.append(egg_dir)
-
-            # common CARLA WindowsNoEditor root (one or two levels up)
-            candidate = os.path.abspath(os.path.join(egg_dir, '..', '..'))
-            dll_dirs.append(candidate)
-
-        # also include any explicitly-listed base_dirs parents
-        for base in base_dirs:
-            dll_dirs.append(os.path.abspath(os.path.join(base, '..', '..')))
-
-        # Filter directories that exist and contain any .dll files
-        valid_dirs = []
-        for d in dll_dirs:
-            if d and os.path.isdir(d):
-                if any(glob.glob(os.path.join(d, '*.dll'))):
-                    valid_dirs.append(d)
-
-        # Prepend to PATH so Windows loader can find native DLLs
-        if valid_dirs:
-            current_path = os.environ.get('PATH', '')
-            # put valid dirs first (preserve order)
-            new_path = os.pathsep.join(valid_dirs) + os.pathsep + current_path
-            os.environ['PATH'] = new_path
-            print('Prepended CARLA native dirs to PATH:', ';'.join(valid_dirs))
-    except Exception as _e:
-        # Fail silently; we'll try the import and surface the error normally
-        print('Warning: could not auto-configure CARLA native DLL PATH:', _e)
-
-import carla
+import carla  
 import random  
 import time  
 import numpy as np  
@@ -95,15 +15,16 @@ class AVConfiguration:
         self.vehicle = vehicle  
         self.config_name = config_name  
         self.sensors = []  
-        self.data_queue = deque(maxlen=100)  
         self.metrics = {  
             'frame': [],  
             'timestamp': [],  
             'latency_ms': [],  
             'cpu_percent': [],  
             'memory_mb': [],  
-            'detections': []  
+            'detections': [],
+            'motion_energy': []
         }  
+        self.previous_frame = None
           
     def cleanup(self):  
         for sensor in self.sensors:  
@@ -138,8 +59,8 @@ class DefaultAVConfig(AVConfiguration):
         array = array.reshape((image.height, image.width, 4))  
         array = array[:, :, :3]  # Remove alpha channel  
           
-        # Simple hazard detection (semantic segmentation simulation)  
-        detections = self.detect_hazards_rgb(array)  
+        # Motion-based hazard detection using frame differencing
+        detections, motion_energy = self.detect_hazards_motion(array)  
           
         latency = (time.time() - start_time) * 1000  # Convert to ms  
           
@@ -148,32 +69,56 @@ class DefaultAVConfig(AVConfiguration):
         self.metrics['latency_ms'].append(latency)  
         self.metrics['cpu_percent'].append(psutil.cpu_percent())  
         self.metrics['memory_mb'].append(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)  
-        self.metrics['detections'].append(len(detections))  
+        self.metrics['detections'].append(len(detections))
+        self.metrics['motion_energy'].append(motion_energy)
+        
+        # Store current frame for next iteration
+        self.previous_frame = cv2.cvtColor(array, cv2.COLOR_RGB2GRAY)
           
-    def detect_hazards_rgb(self, image):  
-        # Simplified detection: use color thresholding as proxy for object detection  
-        # In real implementation, you'd use a neural network  
+    def detect_hazards_motion(self, image):  
+        """Detect hazards based on motion between frames"""
         detections = []  
-          
-        # Detect pedestrians (approximate with skin tones)  
-        lower_skin = np.array([0, 20, 70], dtype=np.uint8)  
-        upper_skin = np.array([20, 255, 255], dtype=np.uint8)  
-        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)  
-        mask = cv2.inRange(hsv, lower_skin, upper_skin)  
-          
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  
+        motion_energy = 0.0
+        
+        if self.previous_frame is None:
+            return detections, motion_energy
+            
+        # Convert current frame to grayscale
+        current_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        
+        # Compute frame difference
+        frame_diff = cv2.absdiff(current_gray, self.previous_frame)
+        
+        # Apply threshold to get significant motion
+        _, motion_mask = cv2.threshold(frame_diff, 30, 255, cv2.THRESH_BINARY)
+        
+        # Calculate total motion energy
+        motion_energy = float(np.sum(motion_mask)) / 255.0
+        
+        # Find contours of moving regions
+        contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  
+        
         for contour in contours:  
-            if cv2.contourArea(contour) > 500:  # Minimum area threshold  
-                detections.append({'type': 'pedestrian', 'area': cv2.contourArea(contour)})  
+            area = cv2.contourArea(contour)
+            if area > 500:  # Minimum area threshold  
+                x, y, w, h = cv2.boundingRect(contour)
+                detections.append({
+                    'type': 'moving_object', 
+                    'area': area,
+                    'bbox': (x, y, w, h),
+                    'motion_magnitude': float(np.sum(motion_mask[y:y+h, x:x+w])) / 255.0
+                })  
                   
-        return detections  
+        return detections, motion_energy
   
 class FusionAVConfig(AVConfiguration):  
     """Fusion AV with RGB + DVS Event Camera"""  
     def __init__(self, world, vehicle):  
         super().__init__(world, vehicle, "Fusion_RGB_DVS")  
-        self.rgb_data = None  
-        self.dvs_data = None  
+        self.event_buffer = []  # Buffer to accumulate events
+        self.last_rgb_timestamp = None
+        self.voxel_grid_shape = (4, 600, 800)  # (temporal_bins, height, width)
+        self.temporal_window_ms = 10.0  # 10ms window for event accumulation
         self.setup_sensors()  
           
     def setup_sensors(self):  
@@ -184,14 +129,14 @@ class FusionAVConfig(AVConfiguration):
         camera_bp.set_attribute('image_size_x', '800')  
         camera_bp.set_attribute('image_size_y', '600')  
         camera_bp.set_attribute('fov', '90')  
-        camera_bp.set_attribute('sensor_tick', '0.05')  
+        camera_bp.set_attribute('sensor_tick', '0.05')  # 20 Hz
           
         camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))  
         camera = self.world.spawn_actor(camera_bp, camera_transform, attach_to=self.vehicle)  
         camera.listen(lambda data: self.process_rgb(data))  
         self.sensors.append(camera)  
           
-        # DVS Event Camera  
+        # DVS Event Camera - runs continuously to accumulate events
         dvs_bp = bp_lib.find('sensor.camera.dvs')  
         dvs_bp.set_attribute('image_size_x', '800')  
         dvs_bp.set_attribute('image_size_y', '600')  
@@ -201,60 +146,144 @@ class FusionAVConfig(AVConfiguration):
         dvs_bp.set_attribute('sigma_positive_threshold', '0')  
         dvs_bp.set_attribute('sigma_negative_threshold', '0')  
         dvs_bp.set_attribute('use_log', 'true')  
-        dvs_bp.set_attribute('sensor_tick', '0.0')  # High frequency  
+        dvs_bp.set_attribute('sensor_tick', '0.0')  # Continuous event capture
           
         dvs = self.world.spawn_actor(dvs_bp, camera_transform, attach_to=self.vehicle)  
-        dvs.listen(lambda data: self.process_dvs(data))  
+        dvs.listen(lambda data: self.accumulate_events(data))  
         self.sensors.append(dvs)  
           
-    def process_rgb(self, image):  
-        array = np.frombuffer(image.raw_data, dtype=np.uint8)  
-        array = array.reshape((image.height, image.width, 4))  
-        self.rgb_data = array[:, :, :3]  
-          
-    def process_dvs(self, data):  
-        start_time = time.time()  
-          
-        # Process DVS events  
+    def accumulate_events(self, data):  
+        """Continuously accumulate events into buffer"""
+        # Parse events from CARLA DVS data
         events = np.frombuffer(data.raw_data, dtype=np.dtype([  
             ('x', np.uint16),  
             ('y', np.uint16),  
             ('t', np.int64),  
             ('pol', np.bool_)  
         ]))  
+        
+        # Store events with their timestamps
+        for event in events:
+            self.event_buffer.append({
+                'x': int(event['x']),
+                'y': int(event['y']),
+                't': float(event['t']) / 1e6,  # Convert to milliseconds
+                'pol': bool(event['pol'])
+            })
           
-        # Fusion detection  
-        detections = self.detect_hazards_fusion(events)  
+    def process_rgb(self, image):  
+        """Process RGB frame and fuse with recent events"""
+        start_time = time.time()  
+        
+        # Convert RGB image to numpy array  
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)  
+        array = array.reshape((image.height, image.width, 4))  
+        rgb_frame = array[:, :, :3]
+        
+        # Get current timestamp in milliseconds
+        current_timestamp_ms = image.timestamp * 1000.0
+        
+        # Create voxel grid from events in the temporal window
+        voxel_grid = self.create_voxel_grid(current_timestamp_ms)
+        
+        # Fusion detection using both RGB and events
+        detections, motion_energy = self.detect_hazards_fusion(rgb_frame, voxel_grid)  
           
-        latency = (time.time() - start_time) * 1000  
+        latency = (time.time() - start_time) * 1000  # Convert to ms
           
-        self.metrics['frame'].append(data.frame)  
-        self.metrics['timestamp'].append(data.timestamp)  
+        self.metrics['frame'].append(image.frame)  
+        self.metrics['timestamp'].append(image.timestamp)  
         self.metrics['latency_ms'].append(latency)  
         self.metrics['cpu_percent'].append(psutil.cpu_percent())  
         self.metrics['memory_mb'].append(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)  
-        self.metrics['detections'].append(len(detections))  
-          
-    def detect_hazards_fusion(self, events):  
-        # Event-based detection: cluster events to find moving objects  
+        self.metrics['detections'].append(len(detections))
+        self.metrics['motion_energy'].append(motion_energy)
+        
+        # Clean up old events to prevent memory overflow
+        self.cleanup_old_events(current_timestamp_ms)
+        self.last_rgb_timestamp = current_timestamp_ms
+    
+    def create_voxel_grid(self, current_timestamp_ms):
+        """Create voxel grid from events in the temporal window"""
+        voxel_grid = np.zeros(self.voxel_grid_shape, dtype=np.float32)
+        
+        if len(self.event_buffer) == 0:
+            return voxel_grid
+        
+        # Define temporal window: [current_time - window_size, current_time]
+        t_start = current_timestamp_ms - self.temporal_window_ms
+        t_end = current_timestamp_ms
+        
+        # Filter events within the temporal window
+        window_events = [e for e in self.event_buffer if t_start <= e['t'] <= t_end]
+        
+        if len(window_events) == 0:
+            return voxel_grid
+        
+        # Assign events to temporal bins
+        num_bins = self.voxel_grid_shape[0]
+        bin_duration = self.temporal_window_ms / num_bins
+        
+        for event in window_events:
+            x, y, t, pol = event['x'], event['y'], event['t'], event['pol']
+            
+            # Ensure coordinates are within bounds
+            if not (0 <= x < self.voxel_grid_shape[2] and 0 <= y < self.voxel_grid_shape[1]):
+                continue
+            
+            # Calculate which temporal bin this event belongs to
+            relative_time = t - t_start
+            bin_idx = int(relative_time / bin_duration)
+            bin_idx = min(bin_idx, num_bins - 1)  # Clamp to valid range
+            
+            # Accumulate event in voxel grid with polarity
+            # Positive events add +1, negative events add -1
+            voxel_grid[bin_idx, y, x] += 1.0 if pol else -1.0
+        
+        return voxel_grid
+    
+    def cleanup_old_events(self, current_timestamp_ms):
+        """Remove events older than needed to prevent memory overflow"""
+        cutoff_time = current_timestamp_ms - (self.temporal_window_ms * 2)  # Keep 2x window for safety
+        self.event_buffer = [e for e in self.event_buffer if e['t'] >= cutoff_time]
+    
+    def detect_hazards_fusion(self, rgb_frame, voxel_grid):  
+        """Detect hazards using event-RGB fusion"""
         detections = []  
-          
-        if len(events) > 0:  
-            # Create event frame  
-            event_frame = np.zeros((600, 800), dtype=np.uint8)  
-            for event in events:  
-                if 0 <= event['y'] < 600 and 0 <= event['x'] < 800:  
-                    event_frame[event['y'], event['x']] = 255 if event['pol'] else 128  
-              
-            # Find clusters of events (moving objects)  
-            _, thresh = cv2.threshold(event_frame, 100, 255, cv2.THRESH_BINARY)  
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  
-              
+        
+        # Calculate motion energy from event voxel grid
+        # Sum absolute values across all temporal bins
+        event_motion = np.sum(np.abs(voxel_grid))
+        
+        # Create a spatial motion map by summing across temporal dimension
+        spatial_motion = np.sum(np.abs(voxel_grid), axis=0)
+        
+        # Threshold to find regions with significant event activity
+        motion_threshold = np.percentile(spatial_motion[spatial_motion > 0], 75) if np.any(spatial_motion > 0) else 0
+        
+        if motion_threshold > 0:
+            _, motion_mask = cv2.threshold(spatial_motion.astype(np.uint8), 
+                                          int(motion_threshold), 255, cv2.THRESH_BINARY)
+            
+            # Find contours of moving regions from events
+            contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  
+            
             for contour in contours:  
-                if cv2.contourArea(contour) > 300:  
-                    detections.append({'type': 'moving_object', 'area': cv2.contourArea(contour)})  
-                      
-        return detections  
+                area = cv2.contourArea(contour)
+                if area > 300:  # Lower threshold since events are more sensitive
+                    x, y, w, h = cv2.boundingRect(contour)
+                    
+                    # Extract motion magnitude in this region across all temporal bins
+                    region_motion = np.sum(np.abs(voxel_grid[:, y:y+h, x:x+w]))
+                    
+                    detections.append({
+                        'type': 'moving_object', 
+                        'area': area,
+                        'bbox': (x, y, w, h),
+                        'motion_magnitude': float(region_motion)
+                    })  
+        
+        return detections, float(event_motion)
   
 def setup_urban_environment(client, town_name='Town03'):  
     """Setup realistic urban environment"""  
@@ -359,11 +388,14 @@ def save_metrics_to_csv(metrics_dict, output_dir='results'):
             'Configuration': config_name,  
             'Avg_Latency_ms': df['latency_ms'].mean(),  
             'Std_Latency_ms': df['latency_ms'].std(),  
-            'Max_Latency_ms': df['latency_ms'].max(),  
+            'Max_Latency_ms': df['latency_ms'].max(),
+            'Min_Latency_ms': df['latency_ms'].min(),
             'Avg_CPU_percent': df['cpu_percent'].mean(),  
             'Avg_Memory_MB': df['memory_mb'].mean(),  
             'Total_Detections': df['detections'].sum(),  
-            'Avg_Detections_per_frame': df['detections'].mean()  
+            'Avg_Detections_per_frame': df['detections'].mean(),
+            'Avg_Motion_Energy': df['motion_energy'].mean(),
+            'Total_Frames': len(df)
         }  
           
         # Save detailed metrics  
@@ -383,10 +415,12 @@ def save_metrics_to_csv(metrics_dict, output_dir='results'):
         df = pd.DataFrame(metrics)  
         comparison_data.append({  
             'Configuration': config_name,  
+            'Frames_Processed': len(df),
             'Avg_Latency_ms': df['latency_ms'].mean(),  
             'Avg_CPU_%': df['cpu_percent'].mean(),  
             'Avg_Memory_MB': df['memory_mb'].mean(),  
-            'Total_Detections': df['detections'].sum()  
+            'Total_Detections': df['detections'].sum(),
+            'Avg_Motion_Energy': df['motion_energy'].mean()
         })  
       
     comparison_df = pd.DataFrame(comparison_data)  
@@ -396,32 +430,10 @@ def save_metrics_to_csv(metrics_dict, output_dir='results'):
     print("\nComparison Results:")  
     print(comparison_df.to_string(index=False))  
   
-def connect_to_carla(host='localhost', port=2000, timeout=10.0, retries=30, wait=1.0):
-    """Attempt to connect to a CARLA simulator with retries.
-
-    Tries to create a client and call a lightweight API (`get_world`) to
-    ensure the server is responsive. Retries with `wait` seconds between
-    attempts and raises RuntimeError if unable to connect.
-    """
-    import time
-    last_exc = None
-    for attempt in range(1, retries + 1):
-        try:
-            client = carla.Client(host, port)
-            client.set_timeout(timeout)
-            # lightweight probe to confirm server is up
-            _ = client.get_world()
-            print(f"Connected to CARLA at {host}:{port} (attempt {attempt})")
-            return client
-        except Exception as e:
-            last_exc = e
-            print(f"Connection attempt {attempt}/{retries} failed: {e}")
-            time.sleep(wait)
-    raise RuntimeError(f"Failed to connect to CARLA at {host}:{port} after {retries} attempts") from last_exc
-
 def main():  
-    # Connect to CARLA (with retries while the server starts)
-    client = connect_to_carla(host='localhost', port=2000, timeout=10.0, retries=30, wait=1.0)
+    # Connect to CARLA  
+    client = carla.Client('localhost', 2000)  
+    client.set_timeout(10.0)  
       
     # Run experiments  
     metrics_dict = {}  
@@ -442,3 +454,5 @@ if __name__ == '__main__':
         print('\nCancelled by user. Bye!')  
     except Exception as e:  
         print(f'Error: {e}')
+        import traceback
+        traceback.print_exc()
