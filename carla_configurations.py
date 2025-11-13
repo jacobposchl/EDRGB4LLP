@@ -266,6 +266,45 @@ def run_experiment(client, config_class, duration_seconds=60):
                 walker.destroy()  
       
     return config.metrics  
+
+
+def run_experiment_on_world(world, spawn_point, config_class, duration_seconds=60):
+    """Run experiment using an already-created world and a fixed spawn_point.
+
+    This helper spawns the ego vehicle at `spawn_point`, attaches the provided
+    configuration, runs the simulation for the requested duration, then cleans
+    up only the ego vehicle and its sensors. Traffic/pedestrians are left for
+    the caller to clean up so multiple experiments can reuse the same world.
+    """
+    print(f"\n{'='*60}")
+    print(f"Running experiment on existing world: {config_class.__name__}")
+    print(f"{'='*60}\n")
+
+    vehicle_bp = world.get_blueprint_library().find('vehicle.tesla.model3')
+    ego_vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+    ego_vehicle.set_autopilot(True)
+
+    config = config_class(world, ego_vehicle)
+
+    start_time = time.time()
+    frame_count = 0
+
+    try:
+        while time.time() - start_time < duration_seconds:
+            world.tick()
+            frame_count += 1
+
+            if frame_count % 100 == 0:
+                elapsed = time.time() - start_time
+                print(f"Progress: {elapsed:.1f}s / {duration_seconds}s ({frame_count} frames)")
+
+    finally:
+        # Cleanup ego + sensors only (leave traffic/pedestrians for caller)
+        config.cleanup()
+        if ego_vehicle.is_alive:
+            ego_vehicle.destroy()
+
+    return config.metrics
   
 def save_metrics_to_csv(metrics_dict, output_dir='results'):  
     """Save metrics to labeled CSV files"""  
@@ -317,21 +356,37 @@ def save_metrics_to_csv(metrics_dict, output_dir='results'):
     print(comparison_df.to_string(index=False))  
   
 def main():  
-    # Connect to CARLA  
-    client = carla.Client('localhost', 2000)  
-    client.set_timeout(10.0)  
-      
-    # Run experiments  
-    metrics_dict = {}  
-      
-    # Test Default Configuration  
-    metrics_dict['Default_RGB_Only'] = run_experiment(client, DefaultAVConfig, duration_seconds=60)  
-      
-    # Test Fusion Configuration  
-    metrics_dict['Fusion_RGB_DVS'] = run_experiment(client, FusionAVConfig, duration_seconds=60)  
-      
-    # Save metrics  
-    save_metrics_to_csv(metrics_dict)  
+    # Connect to CARLA
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(10.0)
+
+    # Make experiment deterministic across runs (helps reproducibility)
+    random.seed(42)
+
+    # Setup environment once and reuse for both AV configs so they start
+    # from the same world and spawn location (comparable runs).
+    world, traffic_vehicles, pedestrians = setup_urban_environment(client)
+
+    # Choose a deterministic spawn point for the ego vehicle
+    spawn_points = world.get_map().get_spawn_points()
+    ego_spawn_point = random.choice(spawn_points)
+
+    metrics_dict = {}
+
+    # Run experiments sequentially on the same world and spawn point
+    metrics_dict['Default_RGB_Only'] = run_experiment_on_world(world, ego_spawn_point, DefaultAVConfig, duration_seconds=60)
+    metrics_dict['Fusion_RGB_DVS'] = run_experiment_on_world(world, ego_spawn_point, FusionAVConfig, duration_seconds=60)
+
+    # Cleanup traffic and pedestrians after both runs
+    for vehicle in traffic_vehicles:
+        if vehicle.is_alive:
+            vehicle.destroy()
+    for walker in pedestrians:
+        if walker.is_alive:
+            walker.destroy()
+
+    # Save metrics
+    save_metrics_to_csv(metrics_dict)
   
 if __name__ == '__main__':  
     try:  
