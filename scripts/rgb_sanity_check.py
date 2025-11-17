@@ -11,6 +11,7 @@ import time
 import csv
 import argparse
 import traceback
+import math
 
 import cv2
 
@@ -27,10 +28,10 @@ from hazard_detection.system import DualSensorSystem
 from hazard_detection.hazards import create_pedestrian_crossing_hazard, create_sudden_brake_hazard
 
 
-def run_rgb_sanity(client, duration_seconds=60, num_hazards=4, frames_per_hazard=15, output_dir='results/rgb_sanity', debug=False):
+def run_rgb_sanity(client, duration_seconds=60, num_hazards=4, frames_per_hazard=15, output_dir='results/rgb_sanity', debug=False, video_seconds=6.0, seed: int = None):
     os.makedirs(output_dir, exist_ok=True)
 
-    world, traffic_vehicles = setup_controlled_environment(client)
+    world, traffic_vehicles = setup_controlled_environment(client, seed=seed)
 
     vehicle_bp = world.get_blueprint_library().find('vehicle.tesla.model3')
     spawn_points = world.get_map().get_spawn_points()
@@ -157,13 +158,39 @@ def run_rgb_sanity(client, duration_seconds=60, num_hazards=4, frames_per_hazard
             out_path = os.path.join(folder, 'video.mp4')
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             try:
-                writer = cv2.VideoWriter(out_path, fourcc, 20.0, (w, h))
+                # Determine fps so that video length is at least `video_seconds`.
+                frames_count = len(frames)
+                desired_seconds = float(video_seconds)
+
+                if frames_count <= 0:
+                    continue
+
+                fps = int(frames_count // desired_seconds) if frames_count >= desired_seconds else 1
+                if fps < 1:
+                    fps = 1
+
+                # If at current fps the length is still less than desired, we'll pad the last frame.
+                length = frames_count / float(fps)
+                pad_count = 0
+                if length < desired_seconds:
+                    required_total = int(math.ceil(desired_seconds * fps))
+                    pad_count = max(0, required_total - frames_count)
+
+                writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+                last_im = None
                 for f in frames:
                     p = os.path.join(folder, f)
                     im = cv2.imread(p)
                     if im is None:
                         continue
                     writer.write(im)
+                    last_im = im
+
+                # Pad with last frame if needed to reach desired duration
+                for _ in range(pad_count):
+                    if last_im is not None:
+                        writer.write(last_im)
+
                 writer.release()
             except Exception:
                 print(f"Failed to encode video for {folder}:\n", traceback.format_exc())
@@ -209,6 +236,8 @@ def main():
     parser.add_argument('--hazards', type=int, default=4)
     parser.add_argument('--frames', type=int, default=15)
     parser.add_argument('--output', default='results/rgb_sanity')
+    parser.add_argument('--video-seconds', type=float, default=6.0, help='Minimum seconds for encoded hazard videos')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed for deterministic environment')
     parser.add_argument('--debug', action='store_true')
 
     args = parser.parse_args()
@@ -217,7 +246,8 @@ def main():
     client.set_timeout(10.0)
 
     run_rgb_sanity(client, duration_seconds=args.duration, num_hazards=args.hazards,
-                   frames_per_hazard=args.frames, output_dir=args.output, debug=args.debug)
+                   frames_per_hazard=args.frames, output_dir=args.output, debug=args.debug,
+                   video_seconds=args.video_seconds, seed=args.seed)
 
 
 if __name__ == '__main__':

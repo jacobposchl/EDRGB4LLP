@@ -1,11 +1,12 @@
 import random
+import math
 import carla
 from typing import Optional
 
 from .events import HazardEvent
 
 
-def create_pedestrian_crossing_hazard(world, ego_vehicle, spawn_distance=15.0, debug: bool = False, start_controller: bool = True) -> Optional[HazardEvent]:
+def create_pedestrian_crossing_hazard(world, ego_vehicle, spawn_distance=30.0, debug: bool = False, start_controller: bool = True) -> Optional[HazardEvent]:
     """Create a pedestrian that crosses in front of ego vehicle
 
     If `start_controller` is False the walker AI controller won't be created/started
@@ -16,11 +17,28 @@ def create_pedestrian_crossing_hazard(world, ego_vehicle, spawn_distance=15.0, d
     ego_location = ego_transform.location
     forward_vector = ego_transform.get_forward_vector()
 
-    # Calculate spawn point ahead of vehicle, to the side
+    # Calculate spawn point ahead of vehicle, offset laterally so the walker starts
+    # outside the RGB camera peripheral and then crosses toward the center.
+    # Compute a lateral vector perpendicular to forward_vector.
+    # Use the lateral vector perpendicular to forward. We'll spawn the walker
+    # slightly to one lateral side and set the target to the opposite side so
+    # its motion is predominantly lateral (left/right) rather than forward.
+    lateral = carla.Vector3D(forward_vector.y, -forward_vector.x, 0.0)
+    lateral_offset = 8.0  # meters to the side; tuned to be outside peripheral
+
+    # Spawn further forward and offset laterally (we spawn on the right side and
+    # target to the left so the walker moves left across the camera view).
     spawn_location = carla.Location(
-        x=ego_location.x + forward_vector.x * spawn_distance + forward_vector.y * 3,
-        y=ego_location.y + forward_vector.y * spawn_distance - forward_vector.x * 3,
+        x=ego_location.x + forward_vector.x * spawn_distance - lateral.x * lateral_offset,
+        y=ego_location.y + forward_vector.y * spawn_distance - lateral.y * lateral_offset,
         z=ego_location.z + 1.0
+    )
+
+    # Target location is lateral across (predominantly lateral movement)
+    target_location = carla.Location(
+        x=spawn_location.x + lateral.x * (2.0 * lateral_offset),
+        y=spawn_location.y + lateral.y * (2.0 * lateral_offset),
+        z=spawn_location.z
     )
 
     # Spawn pedestrian
@@ -29,6 +47,13 @@ def create_pedestrian_crossing_hazard(world, ego_vehicle, spawn_distance=15.0, d
 
     if debug:
         print(f"[DEBUG] Pedestrian spawn: trying walker blueprint {walker_bp.id} at {spawn_location}")
+
+    # Compute rotation so the walker initially faces the crossing target (avoids facing backwards)
+    dx = target_location.x - spawn_location.x
+    dy = target_location.y - spawn_location.y
+    yaw = math.degrees(math.atan2(dy, dx))
+    spawn_rotation = carla.Rotation(yaw=yaw)
+    spawn_transform = carla.Transform(spawn_location, spawn_rotation)
 
     walker = world.try_spawn_actor(walker_bp, spawn_transform)
 
@@ -55,14 +80,21 @@ def create_pedestrian_crossing_hazard(world, ego_vehicle, spawn_distance=15.0, d
         try:
             walker_controller_bp = world.get_blueprint_library().find('controller.ai.walker')
             walker_controller = world.spawn_actor(walker_controller_bp, carla.Transform(), walker)
+            # Start controller and let the world tick so controller initializes properly
             walker_controller.start()
+            try:
+                world.tick()
+            except Exception:
+                pass
 
-            # Make walker cross toward ego vehicle's path
+            # Make walker cross toward ego vehicle's path (opposite lateral side)
             target_location = carla.Location(
-                x=ego_location.x + forward_vector.x * spawn_distance - forward_vector.y * 3,
-                y=ego_location.y + forward_vector.y * spawn_distance + forward_vector.x * 3,
+                x=ego_location.x + forward_vector.x * spawn_distance - lateral.x * lateral_offset,
+                y=ego_location.y + forward_vector.y * spawn_distance - lateral.y * lateral_offset,
                 z=spawn_location.z
             )
+
+            # Issue movement command after controller initialized
             walker_controller.go_to_location(target_location)
             walker_controller.set_max_speed(2.0)
         except Exception as e:

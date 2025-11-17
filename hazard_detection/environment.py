@@ -2,8 +2,11 @@ import random
 import carla
 
 
-def setup_controlled_environment(client, town_name='Town03'):
-    """Setup environment with controlled traffic"""
+def setup_controlled_environment(client, town_name='Town03', seed: int = None):
+    """Setup environment with controlled traffic. If `seed` is provided,
+    random operations will be deterministic for reproducible runs."""
+    if seed is not None:
+        random.seed(seed)
     world = client.load_world(town_name)
 
     weather = carla.WeatherParameters(
@@ -19,17 +22,28 @@ def setup_controlled_environment(client, town_name='Town03'):
     settings.fixed_delta_seconds = 0.05
     world.apply_settings(settings)
 
-    # Spawn moderate traffic
+    # Spawn moderate traffic deterministically when a seed is provided
     spawn_points = world.get_map().get_spawn_points()
     vehicle_bps = world.get_blueprint_library().filter('vehicle.*')
 
     traffic_vehicles = []
-    for i in range(15):  # Fewer vehicles for more controlled environment
+    # Shuffle spawn points deterministically if a seed is set
+    try:
+        spawn_points_list = list(spawn_points)
+    except Exception:
+        spawn_points_list = spawn_points
+
+    if seed is not None:
+        random.shuffle(spawn_points_list)
+
+    for sp in spawn_points_list[:15]:  # try first 15 distinct spawn points
         vehicle_bp = random.choice(vehicle_bps)
-        spawn_point = random.choice(spawn_points)
-        vehicle = world.try_spawn_actor(vehicle_bp, spawn_point)
+        vehicle = world.try_spawn_actor(vehicle_bp, sp)
         if vehicle:
-            vehicle.set_autopilot(True)
+            try:
+                vehicle.set_autopilot(True)
+            except Exception:
+                pass
             traffic_vehicles.append(vehicle)
 
     return world, traffic_vehicles
