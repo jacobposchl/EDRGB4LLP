@@ -1,0 +1,7 @@
+Hazard_ID,Event_Type,Trigger_Time_s,RGB_Detected,RGB_Lag_ms,Fusion_Detected,Fusion_Lag_ms,Latency_Advantage_ms
+1,pedestrian_crossing,10.083552606403828,True,14950.00022277236,False,-1,
+2,sudden_brake,28.233552876859903,True,150.00000223517418,False,-1,
+3,pedestrian_crossing,46.38355314731598,True,750.0000111758709,False,-1,
+4,sudden_brake,64.43355341628194,True,47250.00070407987,False,-1,
+5,pedestrian_crossing,82.63355368748307,True,29050.000432878733,False,-1,
+6,sudden_brake,100.73355395719409,True,10950.000163167715,False,-1,

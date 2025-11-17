@@ -1,9 +1,6 @@
 # Core dependencies - compatible with Python 3.7
 numpy>=1.21,<1.22
 opencv-python<4.6
-torch==1.13.1
-torchvision==0.14.1
-tonic
 expelliarmus
 h5py<3.8
 hdf5plugin
@@ -15,5 +12,4 @@ imageio<2.32
 pillow<10.0
 pyyaml
 tqdm
-google-cloud-storage<2.11
 requests
