@@ -12,6 +12,7 @@ _out/
 *.zip
 processed/
 raw/
+results/
 
 #Misc.
 
