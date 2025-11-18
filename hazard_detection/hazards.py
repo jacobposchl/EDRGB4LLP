@@ -87,14 +87,10 @@ def create_pedestrian_crossing_hazard(world, ego_vehicle, spawn_distance=30.0, d
             except Exception:
                 pass
 
-            # Make walker cross toward ego vehicle's path (opposite lateral side)
-            target_location = carla.Location(
-                x=ego_location.x + forward_vector.x * spawn_distance - lateral.x * lateral_offset,
-                y=ego_location.y + forward_vector.y * spawn_distance - lateral.y * lateral_offset,
-                z=spawn_location.z
-            )
-
-            # Issue movement command after controller initialized
+            # Issue movement command after controller initialized using the
+            # previously-computed `target_location` (opposite lateral side).
+            # NOTE: do not recompute the spawn position here — the earlier
+            # `target_location` is the intended crossing destination.
             walker_controller.go_to_location(target_location)
             walker_controller.set_max_speed(2.0)
         except Exception as e:
