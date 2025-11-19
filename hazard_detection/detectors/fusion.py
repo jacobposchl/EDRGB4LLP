@@ -53,4 +53,8 @@ class FusionDetector(BaseDetector):
             'num_detections': len(detections)
         })
 
+        # Store individual detections for recent-query APIs
+        for d in detections:
+            self.recent_detections.append(d)
+
         return detections, float(event_motion)

@@ -58,10 +58,21 @@ def setup_controlled_environment(client, town_name='Town03', seed: int = None):
     return world, traffic_vehicles
 
 
-def _spawn_ego_vehicle(world, vehicle_bp, spawn_points, debug: bool = False):
-    """Attempt to spawn the ego vehicle robustly and return (ego_vehicle, chosen_spawn)."""
+def _spawn_ego_vehicle(world, vehicle_bp, spawn_points, debug: bool = False, rng=None):
+    """Attempt to spawn the ego vehicle robustly and return (ego_vehicle, chosen_spawn).
+
+    Parameters:
+    - world: CARLA world
+    - vehicle_bp: blueprint for the ego vehicle
+    - spawn_points: iterable of spawn points
+    - debug: enable debug prints
+    - rng: optional randomness source (random module or random.Random instance)
+    """
     ego_vehicle = None
     chosen_spawn = None
+
+    # Use provided RNG or fall back to module-level random
+    rng_local = rng if rng is not None else random
 
     # Prefer spawn points that are not on junctions (straight road segments)
     try:
@@ -79,11 +90,13 @@ def _spawn_ego_vehicle(world, vehicle_bp, spawn_points, debug: bool = False):
 
     # Deterministic shuffle when using an RNG
     try:
-        rng.shuffle(candidate_list)
+        rng_local.shuffle(candidate_list)
     except Exception:
-        # rng may be the global `random` without shuffle; fallback
+        # rng_local may be the module `random` without a shuffle method bound; fallback
         random.shuffle(candidate_list)
-        for sp in candidate_list:
+
+    # Try to spawn at each candidate in order
+    for sp in candidate_list:
         ego_vehicle = world.try_spawn_actor(vehicle_bp, sp)
         if ego_vehicle:
             chosen_spawn = sp
@@ -97,7 +110,7 @@ def _spawn_ego_vehicle(world, vehicle_bp, spawn_points, debug: bool = False):
         # Try a few direct spawn attempts (may raise). Prefer non-junction points
         fallback_candidates = non_junction if non_junction else spawn_points_list
         for _ in range(3):
-            sp = rng.choice(fallback_candidates)
+            sp = rng_local.choice(fallback_candidates)
             try:
                 ego_vehicle = world.spawn_actor(vehicle_bp, sp)
                 chosen_spawn = sp

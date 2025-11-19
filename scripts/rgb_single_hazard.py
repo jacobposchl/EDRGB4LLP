@@ -3,7 +3,7 @@
 Saves a video and CSV with timestamps into `results/rgb_single_hazard/`.
 
 Usage (from project root):
-  python scripts/rgb_single_hazard.py --hazard pedestrian --pre 2 --post 6
+  python scripts\rgb_single_hazard.py --hazard vehicle --debug --target-speed 50
 """
 import os
 import sys
@@ -103,7 +103,7 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     # Warm up
     for _ in range(20):
         # Apply constant throttle to move straight
-        ego_vehicle.apply_control(carla.VehicleControl(throttle=0.5, steer=0.0))
+        ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0))
         world.tick()
         try:
             sensor_system.process_detections([])
@@ -122,7 +122,7 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     
     # Collect pre-frames while driving straight
     for _ in range(pre_frames * 2):
-        ego_vehicle.apply_control(carla.VehicleControl(throttle=0.5, steer=0.0))
+        ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0))
         world.tick()
         
         if sensor_system.rgb_frame is not None:
@@ -140,6 +140,8 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
         if walker is None:
             print("Failed to spawn pedestrian hazard")
             return
+        # Keep reference to hazard event so detectors can be notified
+        hazard_event = ev
         spawn_time = world.get_snapshot().timestamp.elapsed_seconds
         print(f"Pedestrian spawned at t={spawn_time:.2f}s - running across car's path!")
     else:
@@ -155,18 +157,79 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
         if vehicle is None:
             print("Failed to spawn vehicle hazard")
             return
+        # Keep reference to hazard event so detectors can be notified
+        hazard_event = ev
         spawn_time = world.get_snapshot().timestamp.elapsed_seconds
         print(f"Vehicle spawned at t={spawn_time:.2f}s - crossing car's path!")
         print(f"Hazard Vehicle Speed: {target_speed}")
     
     # Start with pre-buffer
     captured_frames = list(buffer)
+
+    # Create a run-specific folder early so we can save annotated frames during recording
+    run_folder = os.path.join(output_dir, f"hazard_{hazard}_{int(time.time())}")
+    os.makedirs(run_folder, exist_ok=True)
+    rgb_annotated_saved = False
+    fusion_annotated_saved = False
+    both_annotated_saved = False
     
     # Collect post-spawn frames - keep driving straight
     print("Recording post-spawn frames...")
     for i in range(post_frames):
-        ego_vehicle.apply_control(carla.VehicleControl(throttle=0.5, steer=0.0))
+        ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0))
         world.tick()
+        # Let detectors process this tick and check for hazard detection
+        try:
+            sensor_system.process_detections([hazard_event])
+        except Exception:
+            pass
+
+        # After processing, check recent detections from each detector and save annotated frames
+        try:
+            # Get recent detections within a short window
+            rgb_recent = sensor_system.rgb_detector.get_recent_detections(window=0.5)
+            fusion_recent = sensor_system.fusion_detector.get_recent_detections(window=0.5)
+
+            # If RGB detections exist and not saved yet, annotate and save
+            if rgb_recent and sensor_system.rgb_frame is not None and not rgb_annotated_saved:
+                img = sensor_system.rgb_frame.copy()
+                for d in rgb_recent:
+                    x, y, w, h = d['bbox']
+                    cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    cx, cy = d['center']
+                    cv2.putText(img, f"RGB area={int(d['area'])}", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+                out_path = os.path.join(run_folder, 'annotated_rgb.png')
+                cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                print(f"Saved annotated RGB frame: {out_path}")
+                rgb_annotated_saved = True
+
+            # If Fusion detections exist and not saved yet, annotate and save
+            if fusion_recent and sensor_system.rgb_frame is not None and not fusion_annotated_saved:
+                img = sensor_system.rgb_frame.copy()
+                for d in fusion_recent:
+                    x, y, w, h = d['bbox']
+                    cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    cv2.putText(img, f"FUS motion={int(d['motion_magnitude'])}", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 1)
+                out_path = os.path.join(run_folder, 'annotated_fusion.png')
+                cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                print(f"Saved annotated Fusion frame: {out_path}")
+                fusion_annotated_saved = True
+
+            # Save combined overlay if both detected
+            if rgb_recent and fusion_recent and sensor_system.rgb_frame is not None and not both_annotated_saved:
+                img = sensor_system.rgb_frame.copy()
+                for d in rgb_recent:
+                    x, y, w, h = d['bbox']
+                    cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                for d in fusion_recent:
+                    x, y, w, h = d['bbox']
+                    cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                out_path = os.path.join(run_folder, 'annotated_both.png')
+                cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                print(f"Saved annotated combined frame: {out_path}")
+                both_annotated_saved = True
+        except Exception:
+            pass
         
         if sensor_system.rgb_frame is not None:
             frame_copy = sensor_system.rgb_frame.copy()
@@ -184,8 +247,13 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     if extra_needed > 0:
         print(f"Collecting {extra_needed} extra frames for minimum duration...")
         for _ in range(extra_needed):
-            ego_vehicle.apply_control(carla.VehicleControl(throttle=0.5, steer=0.0))
+            ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0))
             world.tick()
+            # Process extra frames for detections as well
+            try:
+                sensor_system.process_detections([hazard_event])
+            except Exception:
+                pass
             if sensor_system.rgb_frame is not None:
                 frame_copy = sensor_system.rgb_frame.copy()
                 ts = float(sensor_system.rgb_timestamp)
@@ -193,13 +261,10 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     
     print(f"Captured {len(captured_frames)} total frames")
     
-    # Save video into a run-specific folder inside output_dir
+    # Save video into the run folder created earlier
     if captured_frames:
-        folder = os.path.join(output_dir, f"hazard_{hazard}_{int(time.time())}")
-        os.makedirs(folder, exist_ok=True)
-
-        video_path = os.path.join(folder, 'video.mp4')
-        csv_path = os.path.join(folder, 'timestamps.csv')
+        video_path = os.path.join(run_folder, 'video.mp4')
+        csv_path = os.path.join(run_folder, 'timestamps.csv')
 
         h, w = captured_frames[0][1].shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -214,10 +279,33 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
         out.release()
         print(f"\nSaved video: {video_path}")
         print(f"Saved timestamps: {csv_path}")
+        # Write a simple detection summary for this hazard
+        try:
+            det_csv = os.path.join(run_folder, 'detections.csv')
+            with open(det_csv, 'w') as df:
+                df.write('event_type,trigger_time,detected_rgb,detected_fusion,rgb_lag_ms,fusion_lag_ms,advantage_ms\n')
+                if 'hazard_event' in locals():
+                    he = hazard_event
+                    drgb = f"{he.detected_rgb:.6f}" if he.detected_rgb is not None else ''
+                    dfus = f"{he.detected_fusion:.6f}" if he.detected_fusion is not None else ''
+                    rgb_lag = f"{he.detection_lag_rgb():.1f}" if he.detection_lag_rgb() is not None else ''
+                    fusion_lag = f"{he.detection_lag_fusion():.1f}" if he.detection_lag_fusion() is not None else ''
+                    adv = f"{he.latency_advantage():.1f}" if he.latency_advantage() is not None else ''
+                    df.write(f"{he.event_type},{he.trigger_time:.6f},{drgb},{dfus},{rgb_lag},{fusion_lag},{adv}\n")
+                else:
+                    # No hazard recorded (shouldn't happen), write empty row
+                    df.write('\n')
+            print(f"Saved detections summary: {det_csv}")
+        except Exception as e:
+            print(f"Warning: failed to write detections.csv: {e}")
     
     # Cleanup
     try:
-        sensor_system.destroy()
+        # Prefer cleanup() if provided by the system, otherwise try destroy()
+        if hasattr(sensor_system, 'cleanup'):
+            sensor_system.cleanup()
+        elif hasattr(sensor_system, 'destroy'):
+            sensor_system.destroy()
         if walker is not None:
             walker.destroy()
         if vehicle is not None:

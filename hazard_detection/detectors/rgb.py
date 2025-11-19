@@ -14,12 +14,14 @@ class RGBDetector(BaseDetector):
         motion_energy = 0.0
 
         if self.previous_frame is None:
+            # Initialize previous frame and return nothing this first call
             self.previous_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
             return detections, motion_energy
 
         current_gray = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
         frame_diff = cv2.absdiff(current_gray, self.previous_frame)
-        _, motion_mask = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)
+        # Lowered pixel threshold from 25 -> 15 for increased sensitivity during testing
+        _, motion_mask = cv2.threshold(frame_diff, 15, 255, cv2.THRESH_BINARY)
 
         motion_energy = float(np.sum(motion_mask)) / 255.0
 
@@ -28,17 +30,26 @@ class RGBDetector(BaseDetector):
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area > 400:
+            # Lowered area threshold from 400 -> 200 to detect smaller motions
+            if area > 200:
                 x, y, w, h = cv2.boundingRect(contour)
                 region_motion = float(np.sum(motion_mask[y:y+h, x:x+w])) / 255.0
 
-                detections.append({
+                det = {
                     'timestamp': timestamp,
                     'bbox': (x, y, w, h),
                     'area': area,
                     'motion_magnitude': region_motion,
                     'center': (x + w//2, y + h//2)
-                })
+                }
+                detections.append(det)
+
+                # Debug: print first few detection summaries so we can tune thresholds
+                if len(self.detection_history) == 0 or len(self.recent_detections) < 5:
+                    try:
+                        print(f"[RGB DEBUG] det area={area:.1f} motion={region_motion:.1f} center={det['center']}")
+                    except Exception:
+                        pass
 
         self.previous_frame = current_gray
         self.detection_history.append({
@@ -46,5 +57,10 @@ class RGBDetector(BaseDetector):
             'motion_energy': motion_energy,
             'num_detections': len(detections)
         })
+
+        # Store individual detections for recent-query APIs
+        for d in detections:
+            # ensure timestamp present and append
+            self.recent_detections.append(d)
 
         return detections, motion_energy

@@ -201,8 +201,31 @@ def create_overtake_hazard(world, ego_vehicle, back_distance: float = 8.0, later
 
     if vehicle is None:
         if debug:
-            print(f"[DEBUG] Overtake: failed to spawn vehicle near {spawn_loc}")
-        return None
+            print(f"[DEBUG] Overtake: failed to spawn vehicle near {spawn_loc} after {len(attempts)} attempts")
+            print(f"[DEBUG] Will try fallback random jitter attempts to find free space")
+
+        # Fallback: try a few random nearby offsets to avoid collisions (helpful in crowded maps)
+        import random as _rnd
+        fallback_attempts = 8
+        for i in range(fallback_attempts):
+            jitter_x = _rnd.uniform(-6.0, 6.0)
+            jitter_y = _rnd.uniform(-6.0, 6.0)
+            jitter_z = _rnd.choice((0.5, 1.0, -0.3))
+            tf_try = carla.Transform(carla.Location(spawn_loc.x + jitter_x, spawn_loc.y + jitter_y, spawn_loc.z + jitter_z), spawn_rot)
+            try:
+                vehicle = world.try_spawn_actor(vehicle_bp, tf_try)
+                if vehicle:
+                    if debug:
+                        print(f"[DEBUG] Overtake fallback spawned on attempt {i} at {tf_try.location} (jitter x={jitter_x:.2f}, y={jitter_y:.2f})")
+                    break
+            except Exception as e:
+                if debug:
+                    print(f"[DEBUG] Overtake fallback attempt {i} exception: {e}")
+
+        if vehicle is None:
+            if debug:
+                print(f"[DEBUG] Overtake: all fallback attempts failed. Last spawn_loc={spawn_loc}")
+            return None
 
     try:
         vehicle.set_autopilot(False)

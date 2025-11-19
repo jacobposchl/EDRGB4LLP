@@ -154,21 +154,30 @@ class DualSensorSystem:
 
         # Create voxel grid
         num_bins = self.voxel_shape[0]
-        
-        for event in window_events:
-            x, y, t, pol = event['x'], event['y'], event['t'], event['pol']
+        # Vectorized accumulation for performance
+        height = self.voxel_shape[1]
+        width = self.voxel_shape[2]
 
-            # Check bounds
-            if not (0 <= x < self.voxel_shape[2] and 0 <= y < self.voxel_shape[1]):
-                continue
+        # Build numpy arrays from events
+        xs = np.fromiter((e['x'] for e in window_events), dtype=np.int32)
+        ys = np.fromiter((e['y'] for e in window_events), dtype=np.int32)
+        ts = np.fromiter((e['t'] for e in window_events), dtype=np.float64)
+        pols = np.fromiter((1.0 if e['pol'] else -1.0 for e in window_events), dtype=np.float32)
 
-            # Calculate temporal bin
-            relative_time = t - t_start
-            bin_idx = int((relative_time / temporal_window_s) * num_bins)
-            bin_idx = min(bin_idx, num_bins - 1)
+        # Guard against zero window
+        if temporal_window_s <= 0:
+            return voxel_grid
 
-            # Accumulate event
-            voxel_grid[bin_idx, y, x] += 1.0 if pol else -1.0
+        rel_times = ts - t_start
+        bin_idx = np.floor((rel_times / temporal_window_s) * num_bins).astype(np.int32)
+        bin_idx = np.clip(bin_idx, 0, num_bins - 1)
+
+        valid = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+        if not np.any(valid):
+            return voxel_grid
+
+        # Accumulate into voxel grid using numpy advanced indexing
+        np.add.at(voxel_grid, (bin_idx[valid], ys[valid], xs[valid]), pols[valid])
 
         return voxel_grid
 
@@ -215,8 +224,9 @@ class DualSensorSystem:
             print(f"[DEBUG] Detections: RGB={len(rgb_detections)}, Fusion={len(fusion_detections)}")
 
         # Check if any detections are in critical zone
-        rgb_critical = self.check_critical_detections(rgb_detections)
-        fusion_critical = self.check_critical_detections(fusion_detections)
+        # Use detector-specific thresholds: RGB is less energetic numerically so allow lower threshold
+        rgb_critical = self.check_critical_detections(rgb_detections, threshold=200)
+        fusion_critical = self.check_critical_detections(fusion_detections, threshold=500)
 
         # Update hazard events with detection times
         for hazard in hazard_events:
@@ -231,8 +241,11 @@ class DualSensorSystem:
         # Cleanup old events
         self.cleanup_old_events(timestamp)
 
-    def check_critical_detections(self, detections: List[Dict]) -> bool:
-        """Check if any detection is in critical zone with significant motion"""
+    def check_critical_detections(self, detections: List[Dict], threshold: float = 500.0) -> bool:
+        """Check if any detection is in critical zone with significant motion.
+
+        - `threshold`: motion_magnitude threshold to consider detection critical.
+        """
         for det in detections:
             x, y, w, h = det['bbox']
             center_x, center_y = det['center']
@@ -241,7 +254,7 @@ class DualSensorSystem:
             if (self.critical_zone['x_min'] <= center_x <= self.critical_zone['x_max'] and
                 self.critical_zone['y_min'] <= center_y <= self.critical_zone['y_max']):
                 # Check if motion is significant (lowered threshold for testing)
-                if det['motion_magnitude'] > 500:  # Lowered from 1000
+                if det['motion_magnitude'] > threshold:
                     return True
         return False
 
