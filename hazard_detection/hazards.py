@@ -1,6 +1,8 @@
 import random
 import math
 import carla
+import threading
+import time
 from typing import Optional
 
 from .events import HazardEvent
@@ -17,29 +19,46 @@ def create_pedestrian_crossing_hazard(world, ego_vehicle, spawn_distance=30.0, d
     ego_location = ego_transform.location
     forward_vector = ego_transform.get_forward_vector()
 
-    # Calculate spawn point ahead of vehicle, offset laterally so the walker starts
-    # outside the RGB camera peripheral and then crosses toward the center.
-    # Compute a lateral vector perpendicular to forward_vector.
-    # Use the lateral vector perpendicular to forward. We'll spawn the walker
-    # slightly to one lateral side and set the target to the opposite side so
-    # its motion is predominantly lateral (left/right) rather than forward.
+    # Compute a lateral vector perpendicular to forward_vector and a crossing
+    # point a fixed distance in front of the ego where the walker should cross.
     lateral = carla.Vector3D(forward_vector.y, -forward_vector.x, 0.0)
     lateral_offset = 8.0  # meters to the side; tuned to be outside peripheral
 
-    # Spawn further forward and offset laterally (we spawn on the right side and
-    # target to the left so the walker moves left across the camera view).
-    spawn_location = carla.Location(
-        x=ego_location.x + forward_vector.x * spawn_distance - lateral.x * lateral_offset,
-        y=ego_location.y + forward_vector.y * spawn_distance - lateral.y * lateral_offset,
+    # We'll pick a crossing point a fixed distance in front of ego so the
+    # walker crosses the ego's path predictably (rather than spawning far
+    # ahead and sometimes missing the front of the vehicle).
+    crossing_distance = min(spawn_distance, 12.0)
+    crossing_point = carla.Location(
+        x=ego_location.x + forward_vector.x * crossing_distance,
+        y=ego_location.y + forward_vector.y * crossing_distance,
         z=ego_location.z + 1.0
     )
 
-    # Target location is lateral across (predominantly lateral movement)
-    target_location = carla.Location(
-        x=spawn_location.x + lateral.x * (2.0 * lateral_offset),
-        y=spawn_location.y + lateral.y * (2.0 * lateral_offset),
-        z=spawn_location.z
+    # Spawn to one lateral side of the crossing point and target the opposite
+    # side so motion is lateral across the ego's trajectory.
+    spawn_location = carla.Location(
+        x=crossing_point.x - lateral.x * lateral_offset,
+        y=crossing_point.y - lateral.y * lateral_offset,
+        z=crossing_point.z
     )
+
+    target_location = carla.Location(
+        x=crossing_point.x + lateral.x * lateral_offset,
+        y=crossing_point.y + lateral.y * lateral_offset,
+        z=crossing_point.z
+    )
+
+    # Project both spawn and target to the road surface to avoid z jitter
+    try:
+        wp_spawn = world.get_map().get_waypoint(spawn_location)
+        spawn_location.z = wp_spawn.transform.location.z
+    except Exception:
+        pass
+    try:
+        wp_target = world.get_map().get_waypoint(target_location)
+        target_location.z = wp_target.transform.location.z
+    except Exception:
+        pass
 
     # Spawn pedestrian
     walker_bp = random.choice(world.get_blueprint_library().filter('walker.pedestrian.*'))
@@ -89,10 +108,10 @@ def create_pedestrian_crossing_hazard(world, ego_vehicle, spawn_distance=30.0, d
 
             # Issue movement command after controller initialized using the
             # previously-computed `target_location` (opposite lateral side).
-            # NOTE: do not recompute the spawn position here — the earlier
-            # `target_location` is the intended crossing destination.
+            # Use a higher max speed so the pedestrian runs across the road
+            # quickly (helps ensure it crosses in front of the ego vehicle).
             walker_controller.go_to_location(target_location)
-            walker_controller.set_max_speed(2.0)
+            walker_controller.set_max_speed(6.0)
         except Exception as e:
             if debug:
                 print(f"[DEBUG] Warning: failed to create/start walker controller: {e}")
@@ -113,108 +132,113 @@ def create_pedestrian_crossing_hazard(world, ego_vehicle, spawn_distance=30.0, d
     )
 
 
-def create_sudden_brake_hazard(world, ego_vehicle, debug: bool = False) -> Optional[HazardEvent]:
-    """Create a vehicle ahead that suddenly brakes"""
-    # Find vehicle ahead of ego
-    ego_transform = ego_vehicle.get_transform()
-    ego_location = ego_transform.location
-    forward_vector = ego_transform.get_forward_vector()
+def create_overtake_hazard(world, ego_vehicle, back_distance: float = 8.0, lateral_offset: float = 0.5,
+                          target_speed: float = 50.0, duration: float = 6.0, debug: bool = False) -> Optional[HazardEvent]:
+    """Spawn a hazard vehicle slightly behind the ego in the same lane and drive it at `target_speed`.
 
-    # Look for vehicles in front (relaxed criteria)
-    all_vehicles = world.get_actors().filter('vehicle.*')
-    target_vehicle = None
-    min_distance = float('inf')
+    - `back_distance`: meters behind the ego to spawn the hazard
+    - `lateral_offset`: small lateral offset to avoid initial collision
+    - `target_speed`: absolute speed (m/s) the hazard will aim for
+    - `duration`: how long the hazard will drive before braking
 
-    checked = 0
-    if all_vehicles is None:
-        if debug:
-            print("[DEBUG] Warning: world.get_actors().filter('vehicle.*') returned None")
-    else:
-        for vehicle in all_vehicles:
-            checked += 1
-            try:
-                if vehicle.id == ego_vehicle.id:
-                    continue
+    This function uses `target_speed` directly (no reading of ego velocity),
+    keeping behavior simple and deterministic.
+    """
 
-                v_location = vehicle.get_transform().location
-                to_vehicle = v_location - ego_location
-                # Check if vehicle is ahead (dot product > 0)
-                forward_projection = to_vehicle.x * forward_vector.x + to_vehicle.y * forward_vector.y
+    ego_tf = ego_vehicle.get_transform()
+    ego_loc = ego_tf.location
+    forward = ego_tf.get_forward_vector()
+    # lateral vector (right) perpendicular to forward
+    lateral = carla.Vector3D(-forward.y, forward.x, 0.0)
 
-                if forward_projection > 0:  # Ahead
-                    distance = ego_location.distance(v_location)
-                    # Relaxed distance window to improve chances of finding a target
-                    if 3.0 <= distance <= 35.0 and distance < min_distance:
-                        target_vehicle = vehicle
-                        min_distance = distance
-            except Exception as e:
-                if debug:
-                    print(f"[DEBUG] Exception checking vehicle {getattr(vehicle,'id', 'unknown')}: {e}")
+    # Spawn a bit behind the ego and slightly to the side
+    spawn_loc = carla.Location(
+        x=ego_loc.x - forward.x * back_distance + lateral.x * lateral_offset,
+        y=ego_loc.y - forward.y * back_distance + lateral.y * lateral_offset,
+        z=ego_loc.z + 1.0
+    )
+
+    # Align yaw with ego so vehicle points forward along the road
+    spawn_rot = ego_tf.rotation
+    spawn_tf = carla.Transform(spawn_loc, spawn_rot)
+
+    # Project spawn to road surface
+    try:
+        wp = world.get_map().get_waypoint(spawn_loc)
+        spawn_loc.z = wp.transform.location.z
+        spawn_tf = carla.Transform(spawn_loc, spawn_rot)
+    except Exception:
+        pass
+
+    # pick same vehicle model as ego if possible
+    try:
+        vehicle_bp = world.get_blueprint_library().find(ego_vehicle.type_id)
+    except Exception:
+        vehicle_bp = random.choice(world.get_blueprint_library().filter('vehicle.*'))
 
     if debug:
-        print(f"[DEBUG] Sudden-brake: checked {checked} vehicles, selected target={getattr(target_vehicle,'id', None)} distance={min_distance if target_vehicle else 'N/A'}")
+        print(f"[DEBUG] Overtake spawn attempts for {vehicle_bp.id} near {spawn_loc}")
 
-    # If no suitable vehicle was found, optionally force-spawn a temporary vehicle ahead
-    forced_spawned = False
-    temp_vehicle = None
-    if target_vehicle is None:
-        # Compute a spawn location ahead of ego (~12 meters ahead)
-        spawn_distance = 12.0
-        spawn_location = carla.Location(
-            x=ego_location.x + forward_vector.x * spawn_distance - forward_vector.y * 1.5,
-            y=ego_location.y + forward_vector.y * spawn_distance + forward_vector.x * 1.5,
-            z=ego_location.z + 1.0
-        )
+    # Try a few spawn attempts similar to other function
+    vehicle = None
+    attempts = [spawn_tf]
+    for dz in (0.5, 1.0, -0.3):
+        attempts.append(carla.Transform(carla.Location(spawn_loc.x, spawn_loc.y, spawn_loc.z + dz), spawn_rot))
+    for df in (-2.0, 2.0, -5.0):
+        tloc = carla.Location(spawn_loc.x - forward.x * df, spawn_loc.y - forward.y * df, spawn_loc.z)
+        attempts.append(carla.Transform(tloc, spawn_rot))
 
-        spawn_transform = carla.Transform(spawn_location, ego_transform.rotation)
-        vehicle_bps = world.get_blueprint_library().filter('vehicle.*')
-        bp = random.choice(vehicle_bps)
-        if debug:
-            print(f"[DEBUG] No target found — attempting forced spawn ahead at {spawn_location} using {bp.id}")
-
+    for idx, tf_try in enumerate(attempts):
         try:
-            temp_vehicle = world.try_spawn_actor(bp, spawn_transform)
-            if temp_vehicle is not None:
-                # Advance simulation to initialize transform
-                try:
-                    world.tick()
-                except Exception:
-                    pass
-                # Ensure it's not on autopilot so we can control braking
-                try:
-                    temp_vehicle.set_autopilot(False)
-                except Exception:
-                    pass
-                target_vehicle = temp_vehicle
-                forced_spawned = True
-                min_distance = ego_location.distance(target_vehicle.get_transform().location)
+            vehicle = world.try_spawn_actor(vehicle_bp, tf_try)
+            if vehicle:
                 if debug:
-                    print(f"[DEBUG] Forced spawn succeeded: id={target_vehicle.id} distance={min_distance:.2f}")
+                    print(f"[DEBUG] Overtake vehicle spawned on attempt {idx} at {tf_try.location}")
+                break
         except Exception as e:
             if debug:
-                print(f"[DEBUG] Forced spawn attempt failed: {e}")
+                print(f"[DEBUG] Overtake spawn attempt {idx} exception: {e}")
 
-    if target_vehicle is None:
-        # Still no target found or spawned
+    if vehicle is None:
         if debug:
-            print("[DEBUG] Sudden-brake: no target available after forced spawn attempt")
+            print(f"[DEBUG] Overtake: failed to spawn vehicle near {spawn_loc}")
         return None
 
-    # Apply sudden brake to the chosen target
     try:
-        target_vehicle.apply_control(carla.VehicleControl(brake=1.0))
-    except Exception as e:
-        if debug:
-            print(f"[DEBUG] Failed to apply brake to vehicle {getattr(target_vehicle,'id', 'unknown')}: {e}")
+        vehicle.set_autopilot(False)
+    except Exception:
+        pass
 
-    metadata = {'distance': min_distance}
-    if forced_spawned:
-        metadata['forced_spawn'] = True
-        metadata['forced_bp'] = bp.id if 'bp' in locals() else 'unknown'
+    try:
+        world.tick()
+    except Exception:
+        pass
 
-    return HazardEvent(
-        event_type='sudden_brake',
-        trigger_time=world.get_snapshot().timestamp.elapsed_seconds,
-        actor=target_vehicle,
-        metadata=metadata
-    )
+    # Use the provided absolute `target_speed` directly
+    target_speed = float(target_speed)
+
+    # Simple constant-throttle driver: apply steady forward throttle with no steering
+    def _driver(actor, tgt_speed, dur):
+        try:
+            dt = world.get_settings().fixed_delta_seconds or 0.05
+        except Exception:
+            dt = 0.05
+        throttle = max(0.2, min(1.0, tgt_speed / 30.0))
+        steps = max(1, int(dur / dt))
+        for _ in range(steps):
+            try:
+                actor.apply_control(carla.VehicleControl(throttle=throttle, steer=0.0, brake=0.0))
+            except Exception:
+                pass
+            time.sleep(dt)
+        try:
+            actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+        except Exception:
+            pass
+
+    drv = threading.Thread(target=_driver, args=(vehicle, target_speed, duration))
+    drv.daemon = True
+    drv.start()
+
+    metadata = {'spawn_location': spawn_loc, 'target_speed': target_speed, 'duration': duration}
+    return HazardEvent(event_type='vehicle_overtake', trigger_time=world.get_snapshot().timestamp.elapsed_seconds, actor=vehicle, metadata=metadata)
