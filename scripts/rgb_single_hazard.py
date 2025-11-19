@@ -186,42 +186,59 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
 
         # After processing, check recent detections from each detector and save annotated frames
         try:
-            # Get recent detections within a short window
+            # Get recent detections
             rgb_recent = sensor_system.rgb_detector.get_recent_detections(window=0.5)
             fusion_recent = sensor_system.fusion_detector.get_recent_detections(window=0.5)
 
-            # If RGB detections exist and not saved yet, annotate and save
-            if rgb_recent and sensor_system.rgb_frame is not None and not rgb_annotated_saved:
+            # Filter to only critical detections
+            def filter_critical(detections, threshold):
+                cz = sensor_system.critical_zone
+                return [d for d in detections
+                        if (cz['x_min'] <= d['center'][0] <= cz['x_max'] and
+                            cz['y_min'] <= d['center'][1] <= cz['y_max'] and
+                            d['motion_magnitude'] > threshold)]
+
+            rgb_critical = filter_critical(rgb_recent, 200)  # RGB threshold
+            fusion_critical = filter_critical(fusion_recent, 500)  # Fusion threshold
+
+            # Annotate RGB critical detections
+            if rgb_critical and sensor_system.rgb_frame is not None and not rgb_annotated_saved:
                 img = sensor_system.rgb_frame.copy()
-                for d in rgb_recent:
+                # Draw critical zone
+                cz = sensor_system.critical_zone
+                cv2.rectangle(img, (cz['x_min'], cz['y_min']), (cz['x_max'], cz['y_max']), (255, 255, 0), 2)
+                for d in rgb_critical:
                     x, y, w, h = d['bbox']
                     cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    cx, cy = d['center']
-                    cv2.putText(img, f"RGB area={int(d['area'])}", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+                    cv2.putText(img, f"motion={int(d['motion_magnitude'])}", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
                 out_path = os.path.join(run_folder, 'annotated_rgb.png')
                 cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
                 print(f"Saved annotated RGB frame: {out_path}")
                 rgb_annotated_saved = True
 
-            # If Fusion detections exist and not saved yet, annotate and save
-            if fusion_recent and sensor_system.rgb_frame is not None and not fusion_annotated_saved:
+            # Annotate Fusion critical detections
+            if fusion_critical and sensor_system.rgb_frame is not None and not fusion_annotated_saved:
                 img = sensor_system.rgb_frame.copy()
-                for d in fusion_recent:
+                cz = sensor_system.critical_zone
+                cv2.rectangle(img, (cz['x_min'], cz['y_min']), (cz['x_max'], cz['y_max']), (255, 255, 0), 2)
+                for d in fusion_critical:
                     x, y, w, h = d['bbox']
                     cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 0), 2)
-                    cv2.putText(img, f"FUS motion={int(d['motion_magnitude'])}", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 1)
+                    cv2.putText(img, f"motion={int(d['motion_magnitude'])}", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 1)
                 out_path = os.path.join(run_folder, 'annotated_fusion.png')
                 cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
                 print(f"Saved annotated Fusion frame: {out_path}")
                 fusion_annotated_saved = True
 
-            # Save combined overlay if both detected
-            if rgb_recent and fusion_recent and sensor_system.rgb_frame is not None and not both_annotated_saved:
+            # Annotate combined if both critical
+            if rgb_critical and fusion_critical and sensor_system.rgb_frame is not None and not both_annotated_saved:
                 img = sensor_system.rgb_frame.copy()
-                for d in rgb_recent:
+                cz = sensor_system.critical_zone
+                cv2.rectangle(img, (cz['x_min'], cz['y_min']), (cz['x_max'], cz['y_max']), (255, 255, 0), 2)
+                for d in rgb_critical:
                     x, y, w, h = d['bbox']
                     cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                for d in fusion_recent:
+                for d in fusion_critical:
                     x, y, w, h = d['bbox']
                     cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 0), 2)
                 out_path = os.path.join(run_folder, 'annotated_both.png')
