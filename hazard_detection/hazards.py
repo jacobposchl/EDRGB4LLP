@@ -265,3 +265,182 @@ def create_overtake_hazard(world, ego_vehicle, back_distance: float = 8.0, later
 
     metadata = {'spawn_location': spawn_loc, 'target_speed': target_speed, 'duration': duration}
     return HazardEvent(event_type='vehicle_overtake', trigger_time=world.get_snapshot().timestamp.elapsed_seconds, actor=vehicle, metadata=metadata)
+
+
+def create_oncoming_vehicle_hazard(world, ego_vehicle, front_distance: float = 60.0, lateral_offset: float = 0.0,
+                                  target_speed: float = 25.0, duration: float = 6.0, debug: bool = False) -> Optional[HazardEvent]:
+    """Spawn a vehicle ahead of the ego that drives directly toward it (opposite lane traffic)."""
+
+    ego_tf = ego_vehicle.get_transform()
+    ego_loc = ego_tf.location
+    forward = ego_tf.get_forward_vector()
+    lateral = carla.Vector3D(-forward.y, forward.x, 0.0)
+
+    spawn_loc = carla.Location(
+        x=ego_loc.x + forward.x * front_distance + lateral.x * lateral_offset,
+        y=ego_loc.y + forward.y * front_distance + lateral.y * lateral_offset,
+        z=ego_loc.z + 1.0
+    )
+
+    spawn_yaw = (ego_tf.rotation.yaw + 180.0) % 360.0
+    spawn_rot = carla.Rotation(pitch=ego_tf.rotation.pitch, yaw=spawn_yaw, roll=ego_tf.rotation.roll)
+    spawn_tf = carla.Transform(spawn_loc, spawn_rot)
+
+    try:
+        wp = world.get_map().get_waypoint(spawn_loc)
+        spawn_loc.z = wp.transform.location.z
+        spawn_tf = carla.Transform(spawn_loc, spawn_rot)
+    except Exception:
+        pass
+
+    try:
+        vehicle_bp = world.get_blueprint_library().find(ego_vehicle.type_id)
+    except Exception:
+        vehicle_bp = random.choice(world.get_blueprint_library().filter('vehicle.*'))
+
+    attempts = [spawn_tf]
+    for dz in (0.5, 1.0, -0.5):
+        attempts.append(carla.Transform(carla.Location(spawn_loc.x, spawn_loc.y, spawn_loc.z + dz), spawn_rot))
+    for ds in (-4.0, 4.0):
+        shifted_loc = carla.Location(spawn_loc.x + forward.x * ds, spawn_loc.y + forward.y * ds, spawn_loc.z)
+        attempts.append(carla.Transform(shifted_loc, spawn_rot))
+
+    vehicle = None
+    for idx, tf_try in enumerate(attempts):
+        try:
+            vehicle = world.try_spawn_actor(vehicle_bp, tf_try)
+            if vehicle:
+                if debug:
+                    print(f"[DEBUG] Oncoming vehicle spawned on attempt {idx} at {tf_try.location}")
+                break
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Oncoming spawn attempt {idx} exception: {e}")
+
+    if vehicle is None:
+        if debug:
+            print(f"[DEBUG] Oncoming: failed to spawn vehicle near {spawn_loc}")
+        return None
+
+    try:
+        vehicle.set_autopilot(False)
+    except Exception:
+        pass
+
+    try:
+        world.tick()
+    except Exception:
+        pass
+
+    target_speed = float(target_speed)
+
+    def _driver(actor, tgt_speed, dur):
+        try:
+            dt = world.get_settings().fixed_delta_seconds or 0.05
+        except Exception:
+            dt = 0.05
+        throttle = max(0.2, min(1.0, tgt_speed / 35.0))
+        steps = max(1, int(dur / dt))
+        for _ in range(steps):
+            if not actor.is_alive:
+                break
+            try:
+                actor.apply_control(carla.VehicleControl(throttle=throttle, steer=0.0, brake=0.0))
+            except Exception:
+                break
+            time.sleep(dt)
+        try:
+            actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+        except Exception:
+            pass
+
+    drv = threading.Thread(target=_driver, args=(vehicle, target_speed, duration))
+    drv.daemon = True
+    drv.start()
+
+    metadata = {'spawn_location': spawn_loc, 'target_speed': target_speed, 'duration': duration}
+    return HazardEvent(event_type='oncoming_vehicle', trigger_time=world.get_snapshot().timestamp.elapsed_seconds, actor=vehicle, metadata=metadata)
+
+
+def create_drunk_driver_hazard(world, ego_vehicle, front_distance: float = 25.0, lateral_offset: float = -3.5,
+                               target_speed: float = 35.0, duration: float = 8.0, weave_amplitude: float = 0.35,
+                               debug: bool = False) -> Optional[HazardEvent]:
+    """Spawn a weaving vehicle ahead of the ego to emulate an impaired driver."""
+
+    ego_tf = ego_vehicle.get_transform()
+    ego_loc = ego_tf.location
+    forward = ego_tf.get_forward_vector()
+    lateral = carla.Vector3D(-forward.y, forward.x, 0.0)
+
+    spawn_loc = carla.Location(
+        x=ego_loc.x + forward.x * front_distance + lateral.x * lateral_offset,
+        y=ego_loc.y + forward.y * front_distance + lateral.y * lateral_offset,
+        z=ego_loc.z + 1.0
+    )
+
+    spawn_rot = ego_tf.rotation
+    spawn_tf = carla.Transform(spawn_loc, spawn_rot)
+
+    try:
+        wp = world.get_map().get_waypoint(spawn_loc)
+        spawn_loc.z = wp.transform.location.z
+        spawn_tf = carla.Transform(spawn_loc, spawn_rot)
+    except Exception:
+        pass
+
+    try:
+        vehicle_bp = world.get_blueprint_library().find(ego_vehicle.type_id)
+    except Exception:
+        vehicle_bp = random.choice(world.get_blueprint_library().filter('vehicle.*'))
+
+    vehicle = world.try_spawn_actor(vehicle_bp, spawn_tf)
+
+    if vehicle is None:
+        if debug:
+            print(f"[DEBUG] Drunk driver spawn failed at {spawn_loc}")
+        return None
+
+    try:
+        vehicle.set_autopilot(False)
+    except Exception:
+        pass
+
+    try:
+        world.tick()
+    except Exception:
+        pass
+
+    target_speed = float(target_speed)
+
+    def _drunk_driver(actor, tgt_speed, dur, weave):
+        try:
+            dt = world.get_settings().fixed_delta_seconds or 0.05
+        except Exception:
+            dt = 0.05
+        throttle = max(0.2, min(1.0, tgt_speed / 30.0))
+        steps = max(1, int(dur / dt))
+        for _ in range(steps):
+            if not actor.is_alive:
+                break
+            steer = random.uniform(-weave, weave)
+            try:
+                actor.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=0.0))
+            except Exception:
+                break
+            time.sleep(dt)
+        try:
+            actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+        except Exception:
+            pass
+
+    drv = threading.Thread(target=_drunk_driver, args=(vehicle, target_speed, duration, weave_amplitude))
+    drv.daemon = True
+    drv.start()
+
+    metadata = {
+        'spawn_location': spawn_loc,
+        'target_speed': target_speed,
+        'duration': duration,
+        'weave_amplitude': weave_amplitude
+    }
+    return HazardEvent(event_type='drunk_driver', trigger_time=world.get_snapshot().timestamp.elapsed_seconds, actor=vehicle, metadata=metadata)

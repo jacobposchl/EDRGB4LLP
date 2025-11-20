@@ -22,7 +22,15 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from hazard_detection.system import DualSensorSystem
-from hazard_detection.hazards import create_overtake_hazard, create_pedestrian_crossing_hazard
+from hazard_detection.hazards import (
+    create_overtake_hazard,
+    create_pedestrian_crossing_hazard,
+    create_oncoming_vehicle_hazard,
+    create_drunk_driver_hazard,
+)
+
+
+DEFAULT_HAZARD_SEQUENCE = ['pedestrian', 'overtake', 'oncoming', 'drunk']
 
 
 def setup_straight_road_scene(client, seed=None):
@@ -98,10 +106,55 @@ def _distance_along_forward(start_location: carla.Location, current_location: ca
     return dx * forward_vec.x + dy * forward_vec.y + dz * forward_vec.z
 
 
+def _spawn_hazard_by_type(world, ego_vehicle, hazard_type: str, post_seconds: float,
+                          target_speed: float, debug: bool = False):
+    hazard_type = (hazard_type or '').strip().lower()
+
+    if hazard_type in ('ped', 'pedestrian', 'walker'):
+        return create_pedestrian_crossing_hazard(world, ego_vehicle, debug=debug)
+
+    if hazard_type in ('vehicle', 'overtake', 'rear'):
+        speed = target_speed if target_speed is not None else 45.0
+        return create_overtake_hazard(
+            world,
+            ego_vehicle,
+            back_distance=8.0,
+            lateral_offset=3.5,
+            target_speed=speed,
+            duration=post_seconds + 2.0,
+            debug=debug,
+        )
+
+    if hazard_type in ('oncoming', 'traffic', 'opposite'):
+        speed = target_speed if target_speed is not None else 25.0
+        return create_oncoming_vehicle_hazard(
+            world,
+            ego_vehicle,
+            front_distance=60.0,
+            target_speed=speed,
+            duration=post_seconds + 2.0,
+            debug=debug,
+        )
+
+    if hazard_type in ('drunk', 'drunk_driver', 'weaving'):
+        speed = target_speed if target_speed is not None else 35.0
+        return create_drunk_driver_hazard(
+            world,
+            ego_vehicle,
+            front_distance=25.0,
+            target_speed=speed,
+            duration=post_seconds + 3.0,
+            debug=debug,
+        )
+
+    raise ValueError(f"Unsupported hazard type '{hazard_type}'.")
+
+
 def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
                         min_video_seconds=6.0, output_dir='results/rgb_single_hazard', 
-                        debug=False, seed=None, hazard='vehicle', target_speed: float = None,
-                        travel_distance: float = 60.0, cruise_throttle: float = 0.4):
+                        debug=False, seed=None, hazard='vehicle', hazard_list=None,
+                        target_speed: float = None, travel_distance: float = 60.0,
+                        cruise_throttle: float = 0.4, gap_seconds: float = 1.0):
     os.makedirs(output_dir, exist_ok=True)
     
     world, ego_vehicle = setup_straight_road_scene(client, seed=seed)
@@ -150,9 +203,9 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     
     buffer = deque(maxlen=pre_frames)
     
-    print(f"Recording pedestrian hazard: pre={pre_seconds}s post={post_seconds}s fps={fps}")
+    print(f"Recording hazard sequence: pre={pre_seconds}s post={post_seconds}s fps={fps}")
     print("Car driving straight forward (no autopilot, no turning)")
-    print("Collecting pre-spawn frames...")
+    print("Collecting pre-run frames...")
     
     # Collect pre-frames while driving straight
     for _ in range(pre_frames * 2):
@@ -163,93 +216,53 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
             ts = float(sensor_system.rgb_timestamp)
             buffer.append((ts, frame_copy))
     
-    # Spawn hazard NOW - crossing directly in front
-    walker = None
-    vehicle = None
-    if hazard.lower().startswith('ped'):
-        print("Spawning pedestrian to cross IN FRONT of car...")
-        ev = create_pedestrian_crossing_hazard(world, ego_vehicle, debug=debug)
-        walker = ev.actor if ev is not None else None
-        if walker is None:
-            print("Failed to spawn pedestrian hazard")
-            return
-        # Keep reference to hazard event so detectors can be notified
-        hazard_event = ev
-        spawn_time = world.get_snapshot().timestamp.elapsed_seconds
-        print(f"Pedestrian spawned at t={spawn_time:.2f}s - running across car's path!")
-    else:
-        print("Spawning vehicle OVERTAKE hazard (behind, faster)...")
-        # Spawn hazard slightly behind ego and make it faster so it overtakes
-        # Use explicit `target_speed` if provided; otherwise let the hazard
-        # factory use its own default (keeps behavior simple and predictable).
-        if target_speed is not None:
-            ev = create_overtake_hazard(world, ego_vehicle, back_distance=8.0, lateral_offset=3.5, target_speed=target_speed, duration=post_seconds + 2.0, debug=debug)
-        else:
-            ev = create_overtake_hazard(world, ego_vehicle, back_distance=8.0, lateral_offset=3.5, duration=post_seconds + 2.0, debug=debug)
-        vehicle = ev.actor if ev is not None else None
-        if vehicle is None:
-            print("Failed to spawn vehicle hazard")
-            return
-        # Keep reference to hazard event so detectors can be notified
-        hazard_event = ev
-        spawn_time = world.get_snapshot().timestamp.elapsed_seconds
-        print(f"Vehicle spawned at t={spawn_time:.2f}s - crossing car's path!")
-        print(f"Hazard Vehicle Speed: {target_speed}")
-    
+    hazard_sequence = hazard_list if hazard_list else [hazard]
+    gap_frames = max(0, int(gap_seconds * fps))
+
+    # Keep list of hazard events for detection bookkeeping
+    hazard_events = []
+    spawned_actors = []
+    spawned_controllers = []
+
     # Start with pre-buffer
     captured_frames = list(buffer)
 
     # Create a run-specific folder early so we can save annotated frames during recording
     run_folder = os.path.join(output_dir, f"hazard_{hazard}_{int(time.time())}")
     os.makedirs(run_folder, exist_ok=True)
-    rgb_annotated_saved = False
-    fusion_annotated_saved = False
-    both_annotated_saved = False
-    
-    # Collect post-spawn frames - keep driving straight
-    print("Recording post-spawn frames...")
-    for i in range(post_frames):
-        advance_vehicle()
-        # Let detectors process this tick and check for hazard detection
-        try:
-            sensor_system.process_detections([hazard_event])
-        except Exception:
-            pass
+    annotated_rgb = set()
+    annotated_fusion = set()
+    annotated_both = set()
 
-        # After processing, check recent detections from each detector and save annotated frames
+    def filter_critical(detections, threshold):
+        cz = sensor_system.critical_zone
+        return [d for d in detections
+                if (cz['x_min'] <= d['center'][0] <= cz['x_max'] and
+                    cz['y_min'] <= d['center'][1] <= cz['y_max'] and
+                    d['motion_magnitude'] > threshold)]
+
+    def annotate_detections(label: str):
         try:
-            # Get recent detections
             rgb_recent = sensor_system.rgb_detector.get_recent_detections(window=0.5)
             fusion_recent = sensor_system.fusion_detector.get_recent_detections(window=0.5)
 
-            # Filter to only critical detections
-            def filter_critical(detections, threshold):
-                cz = sensor_system.critical_zone
-                return [d for d in detections
-                        if (cz['x_min'] <= d['center'][0] <= cz['x_max'] and
-                            cz['y_min'] <= d['center'][1] <= cz['y_max'] and
-                            d['motion_magnitude'] > threshold)]
+            rgb_critical = filter_critical(rgb_recent, 200)
+            fusion_critical = filter_critical(fusion_recent, 500)
 
-            rgb_critical = filter_critical(rgb_recent, 200)  # RGB threshold
-            fusion_critical = filter_critical(fusion_recent, 500)  # Fusion threshold
-
-            # Annotate RGB critical detections
-            if rgb_critical and sensor_system.rgb_frame is not None and not rgb_annotated_saved:
+            if rgb_critical and sensor_system.rgb_frame is not None and label not in annotated_rgb:
                 img = sensor_system.rgb_frame.copy()
-                # Draw critical zone
                 cz = sensor_system.critical_zone
                 cv2.rectangle(img, (cz['x_min'], cz['y_min']), (cz['x_max'], cz['y_max']), (255, 255, 0), 2)
                 for d in rgb_critical:
                     x, y, w, h = d['bbox']
                     cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
                     cv2.putText(img, f"motion={int(d['motion_magnitude'])}", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
-                out_path = os.path.join(run_folder, 'annotated_rgb.png')
+                out_path = os.path.join(run_folder, f'annotated_rgb_{label}.png')
                 cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-                print(f"Saved annotated RGB frame: {out_path}")
-                rgb_annotated_saved = True
+                print(f"Saved annotated RGB frame for {label}: {out_path}")
+                annotated_rgb.add(label)
 
-            # Annotate Fusion critical detections
-            if fusion_critical and sensor_system.rgb_frame is not None and not fusion_annotated_saved:
+            if fusion_critical and sensor_system.rgb_frame is not None and label not in annotated_fusion:
                 img = sensor_system.rgb_frame.copy()
                 cz = sensor_system.critical_zone
                 cv2.rectangle(img, (cz['x_min'], cz['y_min']), (cz['x_max'], cz['y_max']), (255, 255, 0), 2)
@@ -257,13 +270,12 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
                     x, y, w, h = d['bbox']
                     cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 0), 2)
                     cv2.putText(img, f"motion={int(d['motion_magnitude'])}", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 1)
-                out_path = os.path.join(run_folder, 'annotated_fusion.png')
+                out_path = os.path.join(run_folder, f'annotated_fusion_{label}.png')
                 cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-                print(f"Saved annotated Fusion frame: {out_path}")
-                fusion_annotated_saved = True
+                print(f"Saved annotated Fusion frame for {label}: {out_path}")
+                annotated_fusion.add(label)
 
-            # Annotate combined if both critical
-            if rgb_critical and fusion_critical and sensor_system.rgb_frame is not None and not both_annotated_saved:
+            if rgb_critical and fusion_critical and sensor_system.rgb_frame is not None and label not in annotated_both:
                 img = sensor_system.rgb_frame.copy()
                 cz = sensor_system.critical_zone
                 cv2.rectangle(img, (cz['x_min'], cz['y_min']), (cz['x_max'], cz['y_max']), (255, 255, 0), 2)
@@ -273,20 +285,61 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
                 for d in fusion_critical:
                     x, y, w, h = d['bbox']
                     cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 0), 2)
-                out_path = os.path.join(run_folder, 'annotated_both.png')
+                out_path = os.path.join(run_folder, f'annotated_both_{label}.png')
                 cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-                print(f"Saved annotated combined frame: {out_path}")
-                both_annotated_saved = True
+                print(f"Saved annotated combined frame for {label}: {out_path}")
+                annotated_both.add(label)
+
         except Exception:
             pass
-        
-        if sensor_system.rgb_frame is not None:
-            frame_copy = sensor_system.rgb_frame.copy()
-            ts = float(sensor_system.rgb_timestamp)
-            captured_frames.append((ts, frame_copy))
-        
-        if (i + 1) % 20 == 0:
-            print(f"  Captured {i+1}/{post_frames} frames...")
+
+    def run_for_frames(num_frames: int, active_events, label: str = None):
+        for i in range(num_frames):
+            advance_vehicle()
+            try:
+                sensor_system.process_detections(active_events)
+            except Exception:
+                pass
+
+            if label is not None:
+                annotate_detections(label)
+
+            if sensor_system.rgb_frame is not None:
+                frame_copy = sensor_system.rgb_frame.copy()
+                ts = float(sensor_system.rgb_timestamp)
+                captured_frames.append((ts, frame_copy))
+
+            if label is not None and (i + 1) % 20 == 0:
+                print(f"  [{label}] Captured {i+1}/{num_frames} frames...")
+
+    # Sequentially spawn hazards for a robust test run
+    for idx, hazard_name in enumerate(hazard_sequence, start=1):
+        label = f"hazard{idx}_{hazard_name}"
+        print(f"Spawning hazard {idx}/{len(hazard_sequence)}: {hazard_name}")
+        try:
+            hazard_event = _spawn_hazard_by_type(world, ego_vehicle, hazard_name, post_seconds, target_speed, debug)
+        except ValueError as err:
+            print(f"[WARN] {err}")
+            continue
+
+        if hazard_event is None or hazard_event.actor is None:
+            print(f"[WARN] Failed to spawn hazard '{hazard_name}'")
+            continue
+
+        hazard_events.append(hazard_event)
+        spawned_actors.append(hazard_event.actor)
+        controller = hazard_event.metadata.get('controller') if isinstance(hazard_event.metadata, dict) else None
+        if controller:
+            spawned_controllers.append(controller)
+
+        spawn_time = world.get_snapshot().timestamp.elapsed_seconds
+        print(f"{hazard_name.title()} hazard spawned at t={spawn_time:.2f}s")
+
+        run_for_frames(post_frames, hazard_events, label=label)
+
+        if gap_frames > 0 and idx < len(hazard_sequence):
+            print(f"  Cooling down for {gap_seconds:.1f}s before next hazard...")
+            run_for_frames(gap_frames, hazard_events, label=None)
     
     # Ensure minimum duration
     total_frames = len(captured_frames)
@@ -296,16 +349,7 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     if extra_needed > 0:
         print(f"Collecting {extra_needed} extra frames for minimum duration...")
         for _ in range(extra_needed):
-            advance_vehicle()
-            # Process extra frames for detections as well
-            try:
-                sensor_system.process_detections([hazard_event])
-            except Exception:
-                pass
-            if sensor_system.rgb_frame is not None:
-                frame_copy = sensor_system.rgb_frame.copy()
-                ts = float(sensor_system.rgb_timestamp)
-                captured_frames.append((ts, frame_copy))
+            run_for_frames(1, hazard_events, label=None)
     
     print(f"Captured {len(captured_frames)} total frames")
     
@@ -332,16 +376,15 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
             det_csv = os.path.join(run_folder, 'detections.csv')
             with open(det_csv, 'w') as df:
                 df.write('event_type,trigger_time,detected_rgb,detected_fusion,rgb_lag_ms,fusion_lag_ms,advantage_ms\n')
-                if 'hazard_event' in locals():
-                    he = hazard_event
-                    drgb = f"{he.detected_rgb:.6f}" if he.detected_rgb is not None else ''
-                    dfus = f"{he.detected_fusion:.6f}" if he.detected_fusion is not None else ''
-                    rgb_lag = f"{he.detection_lag_rgb():.1f}" if he.detection_lag_rgb() is not None else ''
-                    fusion_lag = f"{he.detection_lag_fusion():.1f}" if he.detection_lag_fusion() is not None else ''
-                    adv = f"{he.latency_advantage():.1f}" if he.latency_advantage() is not None else ''
-                    df.write(f"{he.event_type},{he.trigger_time:.6f},{drgb},{dfus},{rgb_lag},{fusion_lag},{adv}\n")
+                if hazard_events:
+                    for he in hazard_events:
+                        drgb = f"{he.detected_rgb:.6f}" if he.detected_rgb is not None else ''
+                        dfus = f"{he.detected_fusion:.6f}" if he.detected_fusion is not None else ''
+                        rgb_lag = f"{he.detection_lag_rgb():.1f}" if he.detection_lag_rgb() is not None else ''
+                        fusion_lag = f"{he.detection_lag_fusion():.1f}" if he.detection_lag_fusion() is not None else ''
+                        adv = f"{he.latency_advantage():.1f}" if he.latency_advantage() is not None else ''
+                        df.write(f"{he.event_type},{he.trigger_time:.6f},{drgb},{dfus},{rgb_lag},{fusion_lag},{adv}\n")
                 else:
-                    # No hazard recorded (shouldn't happen), write empty row
                     df.write('\n')
             print(f"Saved detections summary: {det_csv}")
         except Exception as e:
@@ -360,17 +403,38 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     # Cleanup
     try:
         advance_vehicle(apply_brake=True)
-        # Prefer cleanup() if provided by the system, otherwise try destroy()
+    except Exception:
+        pass
+
+    try:
         if hasattr(sensor_system, 'cleanup'):
             sensor_system.cleanup()
         elif hasattr(sensor_system, 'destroy'):
             sensor_system.destroy()
-        if walker is not None:
-            walker.destroy()
-        if vehicle is not None:
-            vehicle.destroy()
-        ego_vehicle.destroy()
-    except:
+    except Exception:
+        pass
+
+    for controller in spawned_controllers:
+        try:
+            controller.stop()
+        except Exception:
+            pass
+        try:
+            controller.destroy()
+        except Exception:
+            pass
+
+    for actor in spawned_actors:
+        try:
+            if actor and actor.is_alive:
+                actor.destroy()
+        except Exception:
+            pass
+
+    try:
+        if ego_vehicle and ego_vehicle.is_alive:
+            ego_vehicle.destroy()
+    except Exception:
         pass
 
 
@@ -383,18 +447,25 @@ def main():
     parser.add_argument('--min-video-seconds', type=float, default=6.0)
     parser.add_argument('--output', default='results/rgb_single_hazard')
     parser.add_argument('--seed', type=int, default=None)
-    parser.add_argument('--hazard', choices=['pedestrian', 'vehicle'], default='vehicle')
+    parser.add_argument('--hazard', default='vehicle', help='Legacy single-hazard shortcut')
+    parser.add_argument('--hazards', default='pedestrian,overtake,oncoming,drunk',
+                        help='Comma separated hazard types to spawn sequentially (overrides --hazard)')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--target-speed', type=float, default=None, help='Absolute target speed (m/s) for overtake hazard; if omitted a default delta over ego speed is used')
+    parser.add_argument('--gap', type=float, default=1.0, help='Seconds to wait between hazards')
     
     args = parser.parse_args()
     client = carla.Client(args.host, args.port)
     client.set_timeout(10.0)
-    
+
+    hazard_list = [h.strip() for h in args.hazards.split(',') if h.strip()] if args.hazards else None
+
     try:
         record_single_hazard(client, pre_seconds=args.pre, post_seconds=args.post,
                min_video_seconds=args.min_video_seconds, 
-               output_dir=args.output, debug=args.debug, seed=args.seed, hazard=args.hazard, target_speed=args.target_speed)
+               output_dir=args.output, debug=args.debug, seed=args.seed,
+               hazard=args.hazard, hazard_list=hazard_list,
+               target_speed=args.target_speed, gap_seconds=args.gap)
     except Exception as e:
         print(f"Error: {e}")
         traceback.print_exc()
