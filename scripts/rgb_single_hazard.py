@@ -89,9 +89,19 @@ def setup_straight_road_scene(client, seed=None):
 
 
 
+def _distance_along_forward(start_location: carla.Location, current_location: carla.Location,
+                            forward_vec: carla.Vector3D) -> float:
+    """Project displacement from start onto the initial forward vector (meters)."""
+    dx = current_location.x - start_location.x
+    dy = current_location.y - start_location.y
+    dz = current_location.z - start_location.z
+    return dx * forward_vec.x + dy * forward_vec.y + dz * forward_vec.z
+
+
 def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
                         min_video_seconds=6.0, output_dir='results/rgb_single_hazard', 
-                        debug=False, seed=None, hazard='vehicle', target_speed: float = None):
+                        debug=False, seed=None, hazard='vehicle', target_speed: float = None,
+                        travel_distance: float = 60.0, cruise_throttle: float = 0.4):
     os.makedirs(output_dir, exist_ok=True)
     
     world, ego_vehicle = setup_straight_road_scene(client, seed=seed)
@@ -99,12 +109,36 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     
     # NO AUTOPILOT - just drive straight forward
     ego_vehicle.set_autopilot(False)
+    start_tf = ego_vehicle.get_transform()
+    start_loc = start_tf.location
+    forward_vec = start_tf.get_forward_vector()
+    point_b = carla.Location(
+        x=start_loc.x + forward_vec.x * travel_distance,
+        y=start_loc.y + forward_vec.y * travel_distance,
+        z=start_loc.z
+    )
+    print(f"Driving from point A ({start_loc.x:.1f}, {start_loc.y:.1f}) to point B "
+          f"({point_b.x:.1f}, {point_b.y:.1f}) ~{travel_distance:.1f}m straight at throttle {cruise_throttle:.2f}.")
+
+    distance_travelled = 0.0
+    arrived_point_b = False
+
+    def advance_vehicle(apply_brake=False):
+        nonlocal distance_travelled, arrived_point_b
+        throttle = 0.0 if (arrived_point_b or apply_brake) else cruise_throttle
+        brake = 0.8 if (arrived_point_b or apply_brake) else 0.0
+        ego_vehicle.apply_control(carla.VehicleControl(throttle=throttle, steer=0.0, brake=brake))
+        world.tick()
+
+        current_loc = ego_vehicle.get_transform().location
+        distance_travelled = max(0.0, _distance_along_forward(start_loc, current_loc, forward_vec))
+        if not arrived_point_b and distance_travelled >= travel_distance:
+            arrived_point_b = True
+            print(f"[Motion] Reached point B after {distance_travelled:.1f}m. Holding position for remainder of run.")
     
     # Warm up
     for _ in range(20):
-        # Apply constant throttle to move straight
-        ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0))
-        world.tick()
+        advance_vehicle()
         try:
             sensor_system.process_detections([])
         except:
@@ -122,8 +156,7 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     
     # Collect pre-frames while driving straight
     for _ in range(pre_frames * 2):
-        ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0))
-        world.tick()
+        advance_vehicle()
         
         if sensor_system.rgb_frame is not None:
             frame_copy = sensor_system.rgb_frame.copy()
@@ -176,8 +209,7 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     # Collect post-spawn frames - keep driving straight
     print("Recording post-spawn frames...")
     for i in range(post_frames):
-        ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0))
-        world.tick()
+        advance_vehicle()
         # Let detectors process this tick and check for hazard detection
         try:
             sensor_system.process_detections([hazard_event])
@@ -264,8 +296,7 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
     if extra_needed > 0:
         print(f"Collecting {extra_needed} extra frames for minimum duration...")
         for _ in range(extra_needed):
-            ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0))
-            world.tick()
+            advance_vehicle()
             # Process extra frames for detections as well
             try:
                 sensor_system.process_detections([hazard_event])
@@ -316,8 +347,19 @@ def record_single_hazard(client, pre_seconds=2.0, post_seconds=6.0,
         except Exception as e:
             print(f"Warning: failed to write detections.csv: {e}")
     
+    # Finish any remaining travel to ensure the straight-line run completes
+    completion_ticks = 0
+    while not arrived_point_b and completion_ticks < 400:
+        advance_vehicle()
+        completion_ticks += 1
+    if not arrived_point_b:
+        print(f"[WARN] Could not fully reach point B; distance achieved {distance_travelled:.1f}m of {travel_distance:.1f}m.")
+    else:
+        print(f"Completed straight-line traversal ({distance_travelled:.1f}m).")
+
     # Cleanup
     try:
+        advance_vehicle(apply_brake=True)
         # Prefer cleanup() if provided by the system, otherwise try destroy()
         if hasattr(sensor_system, 'cleanup'):
             sensor_system.cleanup()
