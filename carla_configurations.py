@@ -8,6 +8,8 @@ from collections import deque
 import psutil
 import os
 
+from hazard_detection.hazards import create_overtake_hazard
+
 class AVConfiguration:
     """Base class for AV sensor configurations"""
     def __init__(self, world, vehicle, config_name):
@@ -361,7 +363,39 @@ def setup_urban_environment(client, town_name='Town03'):
     
     return world, traffic_vehicles, walker_spawn_points
 
-def run_experiment_on_world(world, spawn_point, config_class, duration_seconds=60, recorded_controls=None):
+def spawn_speeding_hazard(world, ego_vehicle, duration_seconds, debug=False):
+    """Ensure a speeding overtake vehicle is present to the ego's right."""
+    hazard = None
+    # Keep the hazard active through most of the experiment but avoid excessively long threads
+    hazard_duration = max(6.0, min(15.0, duration_seconds * 0.6))
+    for attempt in range(5):
+        hazard = create_overtake_hazard(
+            world,
+            ego_vehicle,
+            back_distance=12.0,
+            lateral_offset=3.5,
+            target_speed=65.0,
+            duration=hazard_duration,
+            debug=debug,
+        )
+        if hazard and hazard.actor:
+            print(f"[Hazard] Speeding car spawned on attempt {attempt + 1} (id={hazard.actor.id})")
+            break
+        # Let the world advance so surrounding traffic can clear space before retrying
+        try:
+            world.tick()
+        except Exception:
+            pass
+
+    if hazard is None or hazard.actor is None:
+        print('[WARN] Failed to spawn speeding hazard vehicle after multiple attempts.')
+        return None
+
+    return hazard
+
+
+def run_experiment_on_world(world, spawn_point, config_class, duration_seconds=60,
+                            recorded_controls=None, enable_speeding_hazard=True, debug=False):
     """
     Run experiment using an existing world and fixed spawn point.
     
@@ -383,6 +417,10 @@ def run_experiment_on_world(world, spawn_point, config_class, duration_seconds=6
 
     # Attach sensor configuration to ego vehicle
     config = config_class(world, ego_vehicle)
+
+    hazard_event = None
+    if enable_speeding_hazard:
+        hazard_event = spawn_speeding_hazard(world, ego_vehicle, duration_seconds, debug=debug)
 
     start_time = time.time()
     frame_count = 0
@@ -431,6 +469,8 @@ def run_experiment_on_world(world, spawn_point, config_class, duration_seconds=6
     finally:
         # Cleanup ego vehicle and sensors (leave traffic for next config)
         config.cleanup()
+        if hazard_event and hazard_event.actor and hazard_event.actor.is_alive:
+            hazard_event.actor.destroy()
         if ego_vehicle.is_alive:
             ego_vehicle.destroy()
 
